@@ -34,6 +34,18 @@ parser.add_argument("--export_io_descriptors", action="store_true", default=Fals
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
+# -- MuJoCo Sim2Sim evaluation (async, triggered on checkpoint save) --
+parser.add_argument(
+    "--sim2sim", action="store_true", default=False,
+    help="Run MuJoCo sim2sim eval on each checkpoint save and upload video to W&B (requires --logger wandb).",
+)
+parser.add_argument("--sim2sim_duration", type=float, default=5.0, help="Sim2sim episode duration in seconds.")
+parser.add_argument("--sim2sim_robot", type=str, default="g1", help="MuJoCo robot name for sim2sim.")
+parser.add_argument(
+    "--sim2sim_xml", type=str, default=None,
+    help="Path to MuJoCo XML for sim2sim (default: auto-detect from unitree_rl_lab assets).",
+)
+parser.add_argument("--sim2sim_every", type=int, default=1, help="Run sim2sim every N checkpoint saves.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -76,11 +88,17 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 """Rest everything follows."""
 
 import gymnasium as gym
+import json
 import logging
 import os
+import queue
+import subprocess
+import threading
 import time
+import numpy as np
 import torch
 from datetime import datetime
+from pathlib import Path
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -109,6 +127,72 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+# ---------------------------------------------------------------------------
+# ONNX export helper (lightweight, no Isaac Sim deps)
+# ---------------------------------------------------------------------------
+def _export_policy_to_onnx(runner: OnPolicyRunner, out_dir: str, filename: str = "policy.onnx") -> str:
+    """Export the actor network to ONNX format (best-effort)."""
+    import onnx
+
+    policy = runner.alg.policy
+    policy.eval()
+
+    if not hasattr(policy, "actor"):
+        raise ValueError("Policy does not have 'actor' attribute")
+
+    obs_dim = policy.actor[0].in_features
+    example_input = torch.zeros(1, obs_dim, device=runner.device)
+    os.makedirs(out_dir, exist_ok=True)
+    onnx_path = os.path.join(out_dir, filename)
+
+    class _PolicyWrapper(torch.nn.Module):
+        def __init__(self, p):
+            super().__init__()
+            self.actor = p.actor
+            self.actor_obs_normalizer = p.actor_obs_normalizer
+            self.state_dependent_std = getattr(p, "state_dependent_std", False)
+
+        def forward(self, obs_: torch.Tensor) -> torch.Tensor:
+            obs_ = self.actor_obs_normalizer(obs_)
+            if self.state_dependent_std:
+                return self.actor(obs_)[..., 0, :]
+            return self.actor(obs_)
+
+    wrapped = _PolicyWrapper(policy)
+    wrapped.eval()
+    torch.onnx.export(
+        wrapped, example_input, onnx_path,
+        input_names=["obs"], output_names=["actions"],
+        dynamic_axes={"obs": {0: "batch"}, "actions": {0: "batch"}},
+        opset_version=11,
+    )
+    onnx.checker.check_model(onnx.load(onnx_path))
+    return onnx_path
+
+
+def _find_sim2sim_resources():
+    """Locate the sim2sim script and default G1 XML from unitree_rl_lab."""
+    rl_lab_root = Path.home() / "unitree_rl_lab"
+    script = rl_lab_root / "scripts" / "mujoco_eval" / "run_sim2sim_locomotion.py"
+    xml = rl_lab_root / "source" / "unitree_rl_lab" / "unitree_rl_lab" / "assets" / "robots" / "unitree_robots" / "g1" / "scene_29dof.xml"
+    return script if script.exists() else None, xml if xml.exists() else None
+
+
+def _log_sim2sim_video_to_wandb(mp4_path: str, iteration: int) -> None:
+    """Upload a sim2sim video to the active W&B run."""
+    try:
+        import wandb
+    except ImportError:
+        return
+    if wandb.run is None:
+        return
+    if not os.path.isfile(mp4_path):
+        return
+    cur_step = max(int(getattr(wandb.run, "step", 0) or 0), iteration)
+    wandb.log({"sim2sim_video": wandb.Video(mp4_path, format="mp4")}, step=cur_step, commit=True)
+    wandb.save(mp4_path, base_path=os.path.dirname(mp4_path), policy="now")
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -212,8 +296,129 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
-    # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    # -------------------------------------------------------------------------
+    # Sim2Sim integration: on each checkpoint save, export ONNX -> run MuJoCo
+    # eval in a subprocess -> upload the video to W&B.
+    # -------------------------------------------------------------------------
+    sim2sim_enabled = bool(getattr(args_cli, "sim2sim", False))
+    sim2sim_script, sim2sim_default_xml = _find_sim2sim_resources()
+    sim2sim_jobs: queue.Queue = queue.Queue()
+    sim2sim_sema = threading.BoundedSemaphore(value=1)
+
+    if sim2sim_enabled and sim2sim_script is None:
+        print("[Sim2Sim][WARN] Could not find run_sim2sim_locomotion.py in ~/unitree_rl_lab. Sim2sim disabled.")
+        sim2sim_enabled = False
+
+    def _sim2sim_poller():
+        """Background thread: wait for subprocess to finish, then upload to W&B."""
+        while True:
+            job = sim2sim_jobs.get()
+            if job is None:
+                return
+            proc = job.get("proc")
+            if proc is None:
+                continue
+            proc.wait()
+            mp4_path = job.get("mp4_path")
+            if mp4_path and os.path.isfile(mp4_path):
+                _log_sim2sim_video_to_wandb(mp4_path, int(job.get("it", 0)))
+            try:
+                lf = job.get("log_f")
+                if lf:
+                    lf.close()
+            except Exception:
+                pass
+            try:
+                if job.get("sema_acquired"):
+                    sim2sim_sema.release()
+            except Exception:
+                pass
+
+    sim2sim_thread = None
+    if sim2sim_enabled:
+        sim2sim_thread = threading.Thread(target=_sim2sim_poller, daemon=True)
+        sim2sim_thread.start()
+
+    _orig_save = runner.save
+    _save_count = {"n": 0}
+
+    def _save_with_sim2sim(path: str, infos=None) -> None:
+        _orig_save(path, infos=infos)
+        if not sim2sim_enabled:
+            return
+        _save_count["n"] += 1
+        every = max(1, int(getattr(args_cli, "sim2sim_every", 1)))
+        if (_save_count["n"] % every) != 0:
+            return
+
+        sema_acquired = sim2sim_sema.acquire(blocking=False)
+        if not sema_acquired:
+            print("[Sim2Sim] skipped: previous sim2sim still running.")
+            return
+
+        it = int(getattr(runner, "current_learning_iteration", 0))
+        try:
+            export_dir = os.path.join(log_dir, "export")
+            onnx_path = _export_policy_to_onnx(runner, export_dir, filename=f"policy_iter_{it}.onnx")
+        except Exception as e:
+            print(f"[Sim2Sim][WARN] ONNX export failed: {e}")
+            sim2sim_sema.release()
+            return
+
+        out_dir = os.path.join(log_dir, "sim2sim", f"iter_{it}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        xml_path = getattr(args_cli, "sim2sim_xml", None) or (str(sim2sim_default_xml) if sim2sim_default_xml else None)
+        if xml_path is None:
+            print("[Sim2Sim][WARN] No MuJoCo XML found. Skipping.")
+            sim2sim_sema.release()
+            return
+
+        duration = float(getattr(args_cli, "sim2sim_duration", 5.0))
+        max_steps = int(duration / 0.02)  # ~50Hz policy rate -> 250 steps for 5s
+        mp4_path = os.path.join(out_dir, "flat_forward_eval.mp4")
+        sim2sim_log = os.path.join(out_dir, "sim2sim.log")
+
+        cmd = [
+            sys.executable, str(sim2sim_script),
+            "--robot", str(getattr(args_cli, "sim2sim_robot", "g1")),
+            "--onnx", str(onnx_path),
+            "--xml", str(xml_path),
+            "--task", "flat_forward",
+            "--num-episodes", "1",
+            "--max-steps", str(max_steps),
+            "--output-dir", str(out_dir),
+            "--save-video",
+            "--video-steps", str(max_steps),
+        ]
+
+        try:
+            log_f = open(sim2sim_log, "w")
+            proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
+            sim2sim_jobs.put({
+                "it": it, "proc": proc, "mp4_path": mp4_path,
+                "log_f": log_f, "sema_acquired": True, "out_dir": out_dir,
+            })
+            print(f"[Sim2Sim] spawned (it={it}, duration={duration}s) -> {out_dir}")
+        except Exception as e:
+            print(f"[Sim2Sim][WARN] Failed to spawn: {e}")
+            sim2sim_sema.release()
+
+    runner.save = _save_with_sim2sim
+
+    try:
+        # run training
+        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    finally:
+        if sim2sim_thread is not None:
+            sim2sim_jobs.put(None)
+        # finalize W&B if active
+        try:
+            writer = getattr(getattr(runner, "logger", None), "writer", None)
+            if writer is not None and hasattr(writer, "stop"):
+                writer.stop()
+        except Exception:
+            pass
 
     print(f"Training time: {round(time.time() - start_time, 2)} seconds")
 

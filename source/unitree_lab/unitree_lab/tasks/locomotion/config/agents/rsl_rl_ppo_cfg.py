@@ -1,5 +1,10 @@
 """PPO runner configurations for locomotion tasks (velocity tracking + AMP)."""
 
+from __future__ import annotations
+
+from dataclasses import MISSING
+from typing import Literal
+
 from isaaclab.utils import configclass
 
 from isaaclab_rl.rsl_rl import (
@@ -8,9 +13,27 @@ from isaaclab_rl.rsl_rl import (
     RslRlPpoAlgorithmCfg as _RslRlPpoAlgorithmCfg,
     RslRlPpoActorCriticRecurrentCfg,
 )
-from rsl_rl.isaaclab_rl import ActorCriticDepthCfg
 
-from dataclasses import MISSING
+
+@configclass
+class ActorCriticDepthCfg(RslRlPpoActorCriticCfg):
+    """Actor-critic with a depth image encoder branch.
+
+    Extends the standard MLP actor-critic by adding a CNN/MLP encoder that
+    processes depth images and outputs a latent vector concatenated with
+    the proprioceptive observation before entering the actor MLP.
+    """
+
+    class_name: str = "ActorCriticDepth"
+
+    depth_encoder_type: Literal["standard", "cnn"] = "standard"
+    """Type of depth encoder. 'standard' uses an MLP, 'cnn' uses a ConvNet."""
+
+    depth_latent_dim: int = 64
+    """Dimension of the latent vector produced by the depth encoder."""
+
+    depth_encoder_hidden_dims: list[int] = MISSING
+    """Hidden layer dimensions for the depth encoder network."""
 
 
 @configclass

@@ -1,6 +1,7 @@
 """Agent configurations for locomotion tasks."""
 
 from .rsl_rl_ppo_cfg import (
+    ActorCriticDepthCfg,
     AMPCfg,
     RslRlGuidanceCfg,
     RslRlPpoAlgorithmCfg,
@@ -11,6 +12,7 @@ from .rsl_rl_ppo_cfg import (
 )
 
 __all__ = [
+    "ActorCriticDepthCfg",
     "AMPCfg",
     "RslRlGuidanceCfg",
     "RslRlPpoAlgorithmCfg",
