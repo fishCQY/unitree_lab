@@ -1,0 +1,3 @@
+"""Robot-specific motion tracking task configurations."""
+
+from .g1 import *  # noqa: F401, F403
