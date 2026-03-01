@@ -5,7 +5,7 @@ custom terrains for curriculum learning.
 
 Usage:
     ```python
-    from unitree_rl_lab.terrain.rough import LEGGED_ROUGH_TERRAINS_CFG
+    from unitree_lab.terrain.rough import LEGGED_ROUGH_TERRAINS_CFG
     env_cfg.scene.terrain = LEGGED_ROUGH_TERRAINS_CFG
     ```
 """

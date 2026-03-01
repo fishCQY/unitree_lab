@@ -45,6 +45,7 @@ class OnnxConfig:
     # PD gains
     joint_stiffness: list[float] = field(default_factory=list)
     joint_damping: list[float] = field(default_factory=list)
+    joint_armature: list[float] = field(default_factory=list)
     tau_limits: list[float] = field(default_factory=list)
     
     # Observation structure

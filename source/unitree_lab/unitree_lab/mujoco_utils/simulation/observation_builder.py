@@ -48,6 +48,9 @@ class ObservationBuilder:
         "joint_vel",
         "joint_vel_rel",
         "last_action",
+        # IsaacLab policy obs group commonly names this term "actions"
+        # (even though the underlying function is last_action).
+        "actions",
         "gait_phase",
         "height_scan",
         "height_scan_safe",
@@ -403,6 +406,28 @@ class ObservationBuilder:
         Returns:
             Observation term array
         """
+        # ---------------------------------------------------------------------
+        # IsaacLab naming compatibility
+        #
+        # In this repo's IsaacLab configs, some observation term *names* are
+        # historically overloaded:
+        # - "actions" term name uses mdp.last_action
+        # - "joint_pos" term name uses mdp.joint_pos_rel (relative to default)
+        # - "joint_vel" term name often uses mdp.joint_vel_rel (same as joint_vel)
+        #
+        # ONNX metadata typically preserves these names, so we alias them here to
+        # reproduce training-time semantics.
+        # ---------------------------------------------------------------------
+        if term_name == "actions":
+            term_name = "last_action"
+        elif term_name == "joint_pos":
+            # Only alias to relative joint positions when we have a meaningful default pose.
+            # This matches IsaacLab's common locomotion setup: joint_pos term is rel.
+            if self.default_joint_pos is not None and self.default_joint_pos.shape[0] == len(joint_pos):
+                term_name = "joint_pos_rel"
+        elif term_name == "joint_vel":
+            term_name = "joint_vel_rel"
+
         # Get scale for this term
         scale = self.obs_scales.get(term_name, 1.0)
         if isinstance(scale, list):
@@ -412,13 +437,10 @@ class ObservationBuilder:
         if term_name == "base_ang_vel":
             # Angular velocity in body frame.
             #
-            # IMPORTANT (MuJoCo convention):
-            # For a free joint, MuJoCo stores the 3 angular velocity components in qvel[3:6]
-            # in the *local/body frame* (not world frame). Therefore, do NOT rotate it again.
-            #
-            # If in some integration you provide world-frame angular velocity here, you may
-            # want to switch back to: compute_base_ang_vel_body(base_quat, base_ang_vel).
-            obs = base_ang_vel.copy()
+            # BaseMujocoSimulator.base_ang_vel returns data.cvel (WORLD frame)
+            # for reliability across <include> scenes.  We must rotate to body
+            # frame to match IsaacLab's root_ang_vel_b observation.
+            obs = compute_base_ang_vel_body(base_quat, base_ang_vel)
             obs = obs * scale
             
         elif term_name == "projected_gravity":
@@ -429,6 +451,7 @@ class ObservationBuilder:
         elif term_name == "velocity_commands":
             # Velocity command [vx, vy, wz]
             obs = velocity_command.copy()
+            obs = obs * scale
             
         elif term_name == "joint_pos":
             # Absolute joint positions
@@ -448,6 +471,7 @@ class ObservationBuilder:
         elif term_name == "last_action":
             # Last policy action
             obs = self._last_action.copy()
+            obs = obs * scale
             
         elif term_name == "gait_phase":
             # Gait phase as sin/cos
@@ -508,7 +532,8 @@ class ObservationBuilder:
         """
         num_joints = len(joint_pos)
         
-        # Angular velocity in body frame
+        # Rotate angular velocity from world frame to body frame (consistent
+        # with _compute_term("base_ang_vel")).
         ang_vel_b = compute_base_ang_vel_body(base_quat, base_ang_vel)
         
         # Projected gravity

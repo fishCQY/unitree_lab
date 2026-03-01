@@ -38,7 +38,7 @@ class LightRunnerConfig:
     
     # Logging
     use_wandb: bool = True
-    wandb_project: str = "unitree_rl_lab"
+    wandb_project: str = "unitree_lab"
     wandb_entity: Optional[str] = None
     
     # Checkpointing
@@ -52,7 +52,7 @@ class LightRunnerConfig:
     # Code snapshot
     save_code: bool = True
     code_dirs: List[str] = field(default_factory=lambda: [
-        "source/unitree_rl_lab",
+        "source/unitree_lab",
         "scripts",
     ])
     

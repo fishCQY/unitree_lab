@@ -1,4 +1,4 @@
-"""Custom terrain module for unitree_rl_lab.
+"""Custom terrain module for unitree_lab.
 
 This module provides custom terrain generation functions and configurations
 for training locomotion policies on challenging terrains.
@@ -16,7 +16,7 @@ Terrain Types:
 
 Usage:
     ```python
-    from unitree_rl_lab.terrain import LEGGED_ROUGH_TERRAINS_CFG
+    from unitree_lab.terrain import LEGGED_ROUGH_TERRAINS_CFG
     env_cfg.scene.terrain = LEGGED_ROUGH_TERRAINS_CFG
     ```
 """

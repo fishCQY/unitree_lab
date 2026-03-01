@@ -33,7 +33,7 @@ class TerrainType(Enum):
     DISCRETE_OBSTACLES = "discrete_obstacles"
     WAVE = "wave"
 
-    # IsaacLab humanoid rough sub-terrain keys (unitree_rl_lab/terrain/rough.py)
+    # IsaacLab humanoid rough sub-terrain keys (unitree_lab/terrain/rough.py)
     STEPPING_STONES = "stepping_stones"
     CAMBERED = "cambered"
     PYRAMID = "pyramid"

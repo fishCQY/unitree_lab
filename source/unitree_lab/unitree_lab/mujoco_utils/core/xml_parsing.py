@@ -207,6 +207,22 @@ def build_joint_mapping(
                 f"XML actuators: {xml_actuator_names}"
             )
     
+    # Guardrail: mapping must be a permutation (no duplicates), otherwise the policy will
+    # drive multiple actuators with the same ONNX action index (and leave others unused),
+    # which typically manifests as violent twitching in sim2sim.
+    if len(set(mapping)) != len(mapping):
+        # Show collisions for quick debugging.
+        inv: dict[int, list[str]] = {}
+        for xml_name, idx in zip(xml_actuator_names, mapping):
+            inv.setdefault(int(idx), []).append(xml_name)
+        collisions = {k: v for k, v in inv.items() if len(v) > 1}
+        raise ValueError(
+            "Ambiguous joint mapping (duplicate ONNX indices detected). "
+            f"Collisions: {collisions}\n"
+            f"ONNX joints ({len(onnx_joint_names)}): {onnx_joint_names}\n"
+            f"XML actuators ({len(xml_actuator_names)}): {xml_actuator_names}"
+        )
+
     return mapping
 
 

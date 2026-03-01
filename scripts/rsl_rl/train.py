@@ -43,7 +43,7 @@ parser.add_argument("--sim2sim_duration", type=float, default=5.0, help="Sim2sim
 parser.add_argument("--sim2sim_robot", type=str, default="g1", help="MuJoCo robot name for sim2sim.")
 parser.add_argument(
     "--sim2sim_xml", type=str, default=None,
-    help="Path to MuJoCo XML for sim2sim (default: auto-detect from unitree_rl_lab assets).",
+    help="Path to MuJoCo XML for sim2sim (default: auto-detect from unitree_lab assets).",
 )
 parser.add_argument("--sim2sim_every", type=int, default=1, help="Run sim2sim every N checkpoint saves.")
 # append RSL-RL cli arguments
@@ -63,29 +63,24 @@ sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-"""Check for minimum supported RSL-RL version."""
+"""Use the local custom rsl_rl library (workspace root)."""
 
-import importlib.metadata as metadata
-import platform
+import sys
+from pathlib import Path
 
-from packaging import version
+_workspace_root = str(Path(__file__).resolve().parents[2])
+if _workspace_root not in sys.path:
+    sys.path.insert(0, _workspace_root)
 
-# check minimum supported rsl-rl version
-RSL_RL_VERSION = "3.0.1"
-installed_version = metadata.version("rsl-rl-lib")
-if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
-    if platform.system() == "Windows":
-        cmd = [r".\isaaclab.bat", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
-    else:
-        cmd = ["./isaaclab.sh", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
+try:
+    import rsl_rl  # noqa: F401
+except ImportError:
     print(
-        f"Please install the correct version of RSL-RL.\nExisting version is: '{installed_version}'"
-        f" and required version is: '{RSL_RL_VERSION}'.\nTo install the correct version, run:"
-        f"\n\n\t{' '.join(cmd)}\n"
+        "[ERROR] Could not import the local rsl_rl package.\n"
+        "Make sure the rsl_rl/ directory exists at the workspace root, or install it via:\n"
+        f"  pip install -e {_workspace_root}/rsl_rl\n"
     )
     exit(1)
-
-"""Rest everything follows."""
 
 import gymnasium as gym
 import json
@@ -98,9 +93,8 @@ import time
 import numpy as np
 import torch
 from datetime import datetime
-from pathlib import Path
 
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner
+from rsl_rl.runners import DistillationRunner, OnPolicyRunner, AMPRunner
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -172,11 +166,60 @@ def _export_policy_to_onnx(runner: OnPolicyRunner, out_dir: str, filename: str =
     return onnx_path
 
 
+def _build_deploy_yaml_from_metadata(meta: dict) -> dict:
+    """Convert unitree_lab ONNX metadata dict -> mjlab-style deploy.yaml schema.
+
+    This file is consumed by scripts/mujoco_eval/run_sim2sim_locomotion.py via --deploy-yaml.
+    It is especially useful when ONNX metadata_json could not be attached (e.g., missing `onnx` pkg).
+    """
+    deploy: dict = {}
+
+    # Core joint/action parameters
+    if isinstance(meta.get("joint_names"), list):
+        deploy["joint_names"] = meta["joint_names"]
+    if isinstance(meta.get("default_joint_pos"), list):
+        deploy["default_joint_pos"] = meta["default_joint_pos"]
+    if isinstance(meta.get("joint_stiffness"), list):
+        deploy["stiffness"] = meta["joint_stiffness"]
+    if isinstance(meta.get("joint_damping"), list):
+        deploy["damping"] = meta["joint_damping"]
+    if isinstance(meta.get("joint_armature"), list):
+        deploy["armature"] = meta["joint_armature"]
+    if meta.get("policy_dt") is not None:
+        try:
+            deploy["step_dt"] = float(meta["policy_dt"])
+        except Exception:
+            pass
+
+    # Actions: match the parser in run_sim2sim_locomotion.py
+    actions: dict = {}
+    jpa: dict = {}
+    if isinstance(meta.get("action_scale"), list):
+        jpa["scale"] = meta["action_scale"]
+    if isinstance(meta.get("action_offset"), list):
+        jpa["offset"] = meta["action_offset"]
+    if jpa:
+        actions["JointPositionAction"] = jpa
+    if actions:
+        deploy["actions"] = actions
+
+    # Observations scales (optional)
+    obs_scales = meta.get("observation_scales")
+    if isinstance(obs_scales, dict) and obs_scales:
+        deploy_obs: dict = {}
+        for k, v in obs_scales.items():
+            deploy_obs[str(k)] = {"scale": v}
+        deploy["observations"] = deploy_obs
+
+    return deploy
+
+
 def _find_sim2sim_resources():
-    """Locate the sim2sim script and default G1 XML from unitree_rl_lab."""
-    rl_lab_root = Path.home() / "unitree_rl_lab"
+    """Locate the sim2sim script and default G1 XML from unitree_lab."""
+    rl_lab_root = Path.home() / "unitree_lab"
     script = rl_lab_root / "scripts" / "mujoco_eval" / "run_sim2sim_locomotion.py"
-    xml = rl_lab_root / "source" / "unitree_rl_lab" / "unitree_rl_lab" / "assets" / "robots" / "unitree_robots" / "g1" / "scene_29dof.xml"
+    # Keep this aligned with scripts/mujoco_eval/run_sim2sim_locomotion.py -> find_robot_xml()
+    xml = rl_lab_root / "source" / "unitree_lab" / "unitree_lab" / "assets" / "robots_xml" / "g1" / "scene_29dof.xml"
     return script if script.exists() else None, xml if xml.exists() else None
 
 
@@ -278,10 +321,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     # create runner from rsl-rl
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    agent_dict = agent_cfg.to_dict()
+
+    if agent_cfg.class_name == "AMPRunner":
+        runner = AMPRunner(env, agent_dict, log_dir=log_dir, device=agent_cfg.device)
+    elif agent_cfg.class_name == "OnPolicyRunner":
+        runner = OnPolicyRunner(env, agent_dict, log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        runner = DistillationRunner(env, agent_dict, log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs
@@ -306,7 +353,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     sim2sim_sema = threading.BoundedSemaphore(value=1)
 
     if sim2sim_enabled and sim2sim_script is None:
-        print("[Sim2Sim][WARN] Could not find run_sim2sim_locomotion.py in ~/unitree_rl_lab. Sim2sim disabled.")
+        print("[Sim2Sim][WARN] Could not find run_sim2sim_locomotion.py in ~/unitree_lab. Sim2sim disabled.")
         sim2sim_enabled = False
 
     def _sim2sim_poller():
@@ -360,6 +407,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         try:
             export_dir = os.path.join(log_dir, "export")
             onnx_path = _export_policy_to_onnx(runner, export_dir, filename=f"policy_iter_{it}.onnx")
+            # Attach IsaacLab metadata to ONNX so MuJoCo sim2sim can match:
+            # - joint order (joint_names)
+            # - action scale/offset
+            # - observation layout + history stacking
+            # - PD gains and timing (policy_dt/decimation/sim_dt)
+            try:
+                from unitree_lab.utils.onnx_utils import build_onnx_metadata, attach_onnx_metadata
+
+                # build_onnx_metadata expects the underlying IsaacLab env (ManagerBasedRLEnv),
+                # not the RSL-RL wrapper.
+                base_env = getattr(env, "unwrapped", env)
+                meta = build_onnx_metadata(base_env)
+                attach_onnx_metadata(onnx_path, meta)
+
+                # Always dump a deploy.yaml next to the ONNX for robust sim2sim debugging.
+                # This does NOT require attaching metadata to ONNX.
+                deploy_yaml = _build_deploy_yaml_from_metadata(meta)
+                deploy_yaml_path = os.path.join(export_dir, f"deploy_iter_{it}.yaml")
+                dump_yaml(deploy_yaml_path, deploy_yaml)
+                # Also keep a stable "latest" pointer for convenience.
+                dump_yaml(os.path.join(export_dir, "deploy_latest.yaml"), deploy_yaml)
+            except Exception as e:
+                print(f"[Sim2Sim][WARN] Failed to attach ONNX metadata_json: {e}")
         except Exception as e:
             print(f"[Sim2Sim][WARN] ONNX export failed: {e}")
             sim2sim_sema.release()

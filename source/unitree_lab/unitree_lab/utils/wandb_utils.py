@@ -33,7 +33,7 @@ class WandbConfig:
     """Configuration for WandB integration."""
     
     # Project settings
-    project: str = "unitree_rl_lab"
+    project: str = "unitree_lab"
     entity: Optional[str] = None  # WandB team/user name
     group: Optional[str] = None   # Experiment group (e.g., "locomotion", "amp")
     job_type: Optional[str] = None  # Job type (e.g., "train", "eval", "sim2sim")
@@ -477,7 +477,7 @@ class WandbFileSaver:
     
     Example:
         >>> saver = WandbFileSaver()
-        >>> saver.save_directory("source/unitree_rl_lab/unitree_rl_lab")
+        >>> saver.save_directory("source/unitree_lab/unitree_lab")
     """
     
     def __init__(
@@ -544,7 +544,7 @@ class WandbFileSaver:
 
 # Convenience functions
 def init_wandb(
-    project: str = "unitree_rl_lab",
+    project: str = "unitree_lab",
     name: Optional[str] = None,
     config: Optional[Dict[str, Any]] = None,
     tags: Optional[List[str]] = None,

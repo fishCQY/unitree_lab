@@ -79,6 +79,20 @@ class BaseMujocoSimulator:
         self.model = mujoco.MjModel.from_xml_path(str(self.xml_path))
         self.data = mujoco.MjData(self.model)
 
+        # Determine the body id associated with the floating base (if any).
+        # For free joints, MuJoCo's generalized velocities (qvel) are not a reliable
+        # source for spatial base velocities across models; instead we use data.cvel
+        # for the body that owns the free joint.
+        self._base_body_id: int | None = None
+        try:
+            # Find first free joint (jnt_type == 0) and use its owning body.
+            free_joints = np.where(np.asarray(self.model.jnt_type, dtype=np.int32) == 0)[0]
+            if free_joints.size > 0:
+                jid0 = int(free_joints[0])
+                self._base_body_id = int(self.model.jnt_bodyid[jid0])
+        except Exception:
+            self._base_body_id = None
+
         # Optional spawn adjustment for heightfield terrains (set by sim2sim runner).
         # If >0, we will lift the floating base root z on every reset to avoid initial
         # interpenetration with raised terrains.
@@ -89,6 +103,18 @@ class BaseMujocoSimulator:
         self.decimation = self.onnx_config.decimation
         self.policy_dt = self.sim_dt * self.decimation
         self.model.opt.timestep = self.sim_dt
+
+        # Use implicitfast integrator for stability with stiff PD position servos.
+        # MuJoCo's default Euler integrator is explicit and can become unstable
+        # when high-stiffness joint drives are solved as implicit actuators.
+        # implicitfast handles implicit joint-level forces (Kp, Kd) within the
+        # integration step, matching the behavior of PhysX's TGS solver used by
+        # IsaacLab during training.
+        self.model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+
+        # Increase solver iterations for humanoid contact stability.
+        self.model.opt.iterations = 50
+        self.model.opt.ls_iterations = 50
 
         # Build robust actuator <-> (joint,qpos,dof) mappings from the loaded MuJoCo model.
         # This is critical for scene/include XMLs where qpos slices are not aligned with actuator order.
@@ -102,6 +128,15 @@ class BaseMujocoSimulator:
         
         # Setup PD gains
         self._setup_pd_gains()
+
+        # Convert MuJoCo motor actuators to position servos so the PD law is
+        # integrated implicitly by MuJoCo's engine.  This matches the behaviour
+        # of PhysX implicit actuators used by IsaacLab during training – explicit
+        # PD via qfrc_applied is too weak with the same Kp/Kd gains.
+        self._configure_position_servos()
+
+        # Align ground contact parameters with IsaacLab defaults.
+        self._configure_contact_params()
         
         # Load policy
         self.policy = OnnxInference(onnx_path)
@@ -232,8 +267,20 @@ class BaseMujocoSimulator:
             self.inv_joint_mapping[onnx_i] = act_i
         
         self.xml_actuator_names = use_names
-        
-        print(f"[Sim2Sim] Joint mapping: {self.joint_mapping}")
+
+        # Human-readable mapping for quick sim2sim debugging.
+        # Interpretation: actuator i (MuJoCo application order) corresponds to ONNX joint index j.
+        print(f"[Sim2Sim] Joint mapping (actuator->onnx): {self.joint_mapping}")
+        try:
+            if onnx_joint_names:
+                print("[Sim2Sim] Actuator->ONNX name pairs:")
+                for act_i, onnx_i in enumerate(self.joint_mapping):
+                    act_name = str(use_names[act_i]) if act_i < len(use_names) else f"act_{act_i}"
+                    onnx_name = str(onnx_joint_names[onnx_i]) if 0 <= int(onnx_i) < len(onnx_joint_names) else f"onnx_{onnx_i}"
+                    print(f"  - {act_i:02d}: {act_name}  ->  {onnx_i:02d}: {onnx_name}")
+        except Exception:
+            # Keep mapping robust even if printing fails.
+            pass
     
     def _apply_physics_params(self) -> None:
         """Apply physics parameters from ONNX to MuJoCo model."""
@@ -246,13 +293,10 @@ class BaseMujocoSimulator:
     
     def _setup_pd_gains(self) -> None:
         """Setup PD gains from ONNX config or XML."""
-        # Get from ONNX config
         if self.onnx_config.joint_stiffness:
             kp_onnx = np.array(self.onnx_config.joint_stiffness)
-            # Map to MuJoCo actuator order
             self.kp = kp_onnx[self.joint_mapping]
         else:
-            # Default gains
             self.kp = np.ones(self.num_actions) * 100.0
         
         if self.onnx_config.joint_damping:
@@ -260,19 +304,18 @@ class BaseMujocoSimulator:
             self.kd = kd_onnx[self.joint_mapping]
         else:
             self.kd = np.ones(self.num_actions) * 10.0
-        # tau_limits already set from model.jnt_actfrcrange in _setup_actuator_state_mapping()
         
-        # Action scale and offset
         if self.onnx_config.action_scale:
             scale_onnx = np.array(self.onnx_config.action_scale)
             self.action_scale = scale_onnx[self.joint_mapping]
         else:
             self.action_scale = np.ones(self.num_actions) * 0.25
 
-        if getattr(self.onnx_config, "action_offset", None):
+        self._action_offset_provided = bool(getattr(self.onnx_config, "action_offset", []))
+
+        if self._action_offset_provided:
             offset_onnx = np.array(self.onnx_config.action_offset, dtype=np.float32).reshape(-1)
             if offset_onnx.shape[0] != self.onnx_action_dim:
-                # Best-effort: pad/truncate
                 if offset_onnx.shape[0] < self.onnx_action_dim:
                     offset_onnx = np.concatenate(
                         [offset_onnx, np.zeros(self.onnx_action_dim - offset_onnx.shape[0], dtype=np.float32)]
@@ -287,14 +330,150 @@ class BaseMujocoSimulator:
             default_onnx = np.array(self.onnx_config.default_joint_pos)
             self.default_joint_pos = default_onnx[self.joint_mapping]
         else:
-            # Best-effort fallback: use MuJoCo model's initial qpos for each actuator joint.
             self.default_joint_pos = np.array([self.data.qpos[a] for a in self._qpos_adrs], dtype=np.float32)
 
-        # Also keep default joint pos in ONNX order for observation alignment.
         self.default_joint_pos_onnx = self.default_joint_pos[np.array(self.inv_joint_mapping, dtype=np.int64)].copy()
         
         print(f"[Sim2Sim] PD gains: Kp={self.kp[:3]}..., Kd={self.kd[:3]}...")
         print(f"[Sim2Sim] Action scale: {self.action_scale[:3]}...")
+
+    def _configure_position_servos(self) -> None:
+        """Reconfigure MuJoCo motor actuators as position servos.
+
+        IsaacLab trains with PhysX *implicit* PD (joint drives solved inside the
+        constraint solver).  Explicit PD (τ = Kp·e − Kd·dq applied via qfrc_applied)
+        with the *same* gains is far too weak in MuJoCo – the robot collapses under
+        gravity.
+
+        The fix is to turn every motor actuator into a *position servo* so MuJoCo's
+        own integrator handles the PD law:
+
+            force = gainprm[0] * ctrl          (= Kp·q_target)
+                  + biasprm[1] * q_joint       (= −Kp·q_current)
+                  + biasprm[2] * dq_joint      (= −Kd·dq)
+
+        After this, ``data.ctrl[i]`` accepts target joint positions (not torques).
+
+        Additionally, we zero out MuJoCo's native ``dof_damping`` and
+        ``dof_frictionloss`` on actuated joints.  IsaacLab's ImplicitActuator
+        sets friction=0 for all groups, and the PD damping is the *only* velocity
+        dependent force.  Leaving MuJoCo's default XML damping (e.g. 0.05) and
+        friction (e.g. 0.2) active would double-count dissipation, over-damp the
+        joints, and make the observed joint velocities too small compared to what
+        the policy saw during training.
+        """
+        for act_id in range(self.num_actions):
+            jid = self._actuator_joint_ids[act_id]
+            dof_adr = self._dof_adrs[act_id]
+            kp_i = float(self.kp[act_id])
+            kd_i = float(self.kd[act_id])
+
+            self.model.actuator_gaintype[act_id] = 0          # fixed gain
+            self.model.actuator_biastype[act_id] = 1          # affine bias
+            self.model.actuator_gainprm[act_id, :] = 0.0
+            self.model.actuator_gainprm[act_id, 0] = kp_i
+            self.model.actuator_biasprm[act_id, :] = 0.0
+            self.model.actuator_biasprm[act_id, 1] = -kp_i
+            self.model.actuator_biasprm[act_id, 2] = -kd_i
+
+            # Do NOT clip ctrl to joint range. IsaacLab's JointPositionAction
+            # only clips processed actions to a very wide range ([-100, 100] rad)
+            # and lets the PhysX joint limits handle physical constraint. Clipping
+            # to jnt_range reduces the PD position error near limits, producing
+            # weaker corrective forces than what the policy expects.
+            self.model.actuator_ctrllimited[act_id] = 0
+
+            frc_range = self.tau_limits[act_id]
+            if np.isfinite(frc_range).all() and not np.allclose(frc_range, 0):
+                self.model.actuator_forcerange[act_id] = frc_range
+                self.model.actuator_forcelimited[act_id] = 1
+
+            self.model.actuator_dyntype[act_id] = 0           # no dynamics filter
+
+            self.model.dof_damping[dof_adr] = 0.0
+            self.model.dof_frictionloss[dof_adr] = 0.0
+
+        if self.onnx_config.joint_armature:
+            arm_onnx = np.array(self.onnx_config.joint_armature, dtype=np.float64)
+            arm_act = arm_onnx[np.array(self.joint_mapping, dtype=np.int64)]
+            for act_id in range(self.num_actions):
+                self.model.dof_armature[self._dof_adrs[act_id]] = float(arm_act[act_id])
+            print(f"[Sim2Sim] Applied joint_armature from config (first 3: {arm_act[:3]})")
+
+        print("[Sim2Sim] Actuators reconfigured as position servos (implicit PD via data.ctrl)")
+        print("[Sim2Sim] Zeroed dof_damping & dof_frictionloss on actuated joints")
+
+    def _configure_contact_params(self) -> None:
+        """Align MuJoCo contact/solver parameters with IsaacLab/PhysX defaults.
+
+        IsaacLab training environment (G1 rough):
+          - terrain physics_material: static_friction=1.0, dynamic_friction=1.0,
+            restitution=1.0, friction_combine_mode="multiply"
+          - PhysX TGS solver with hard contacts and pyramidal friction cone
+          - max_depenetration_velocity=1.0
+
+        MuJoCo differences addressed here:
+          1. Friction cone: switch to pyramidal (PhysX uses pyramid model)
+          2. Robot foot geom friction: set to 1.0 to match Isaac Lab defaults
+          3. Floor geom friction: set to 1.0
+          4. solref/solimp: tuned for harder contacts (closer to PhysX)
+          5. noslip_iterations: prevent contact sliding artifacts
+        """
+        # --- Friction cone model ---
+        # PhysX uses a pyramidal friction cone; MuJoCo defaults to elliptic.
+        self.model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
+
+        # --- noslip solver ---
+        # PhysX's TGS solver enforces no-slip friction constraints more
+        # aggressively than MuJoCo's default solver.  A few noslip iterations
+        # help prevent foot sliding at the cost of a small performance hit.
+        self.model.opt.noslip_iterations = 10
+
+        # --- Contact softness (solref / solimp) ---
+        # MuJoCo defaults: solref=[0.02, 1.0], solimp=[0.9, 0.95, 0.001, 0.5, 2]
+        # PhysX contacts are much harder.  We use a shorter time-constant and
+        # higher impedance to reduce ground compliance.
+        HARD_SOLREF = np.array([0.005, 1.0])      # shorter time-constant → stiffer
+        HARD_SOLIMP = np.array([0.95, 0.99, 0.001, 0.5, 2.0])
+
+        # --- Floor geom ---
+        floor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        if floor_id >= 0:
+            self.model.geom_friction[floor_id] = [1.0, 0.005, 0.0001]
+            self.model.geom_solref[floor_id] = HARD_SOLREF
+            self.model.geom_solimp[floor_id] = HARD_SOLIMP
+
+        # --- Heightfield geom (terrain scenes) ---
+        hfield_geom_id = -1
+        for gid in range(self.model.ngeom):
+            if self.model.geom_type[gid] == mujoco.mjtGeom.mjGEOM_HFIELD:
+                hfield_geom_id = gid
+                break
+        if hfield_geom_id >= 0:
+            self.model.geom_friction[hfield_geom_id] = [1.0, 0.005, 0.0001]
+            self.model.geom_solref[hfield_geom_id] = HARD_SOLREF
+            self.model.geom_solimp[hfield_geom_id] = HARD_SOLIMP
+
+        # --- Robot collision geoms ---
+        # Set friction for all robot collidable geoms (body_id > 0) to 1.0
+        # to match Isaac Lab's rigid_body_material defaults.
+        # Also harden their contact parameters.
+        n_robot_geoms_set = 0
+        for gid in range(self.model.ngeom):
+            body_id = self.model.geom_bodyid[gid]
+            if body_id <= 0:
+                continue
+            contype = int(self.model.geom_contype[gid])
+            conaff = int(self.model.geom_conaffinity[gid])
+            if contype == 0 and conaff == 0:
+                continue
+            self.model.geom_friction[gid] = [1.0, 0.005, 0.0001]
+            self.model.geom_solref[gid] = HARD_SOLREF
+            self.model.geom_solimp[gid] = HARD_SOLIMP
+            n_robot_geoms_set += 1
+
+        print(f"[Sim2Sim] Contact alignment: cone=pyramidal, noslip_iter=10, "
+              f"solref={HARD_SOLREF.tolist()}, robot_geoms_configured={n_robot_geoms_set}")
     
     @property
     def joint_pos(self) -> np.ndarray:
@@ -330,13 +509,38 @@ class BaseMujocoSimulator:
     
     @property
     def base_lin_vel(self) -> np.ndarray:
-        """Get base linear velocity in world frame."""
+        """Get base linear velocity in world frame.
+
+        Uses ``data.cvel`` (refreshed by :meth:`step` via ``mj_forward``).
+        Fallback to ``data.qvel[:3]`` (local frame for free joints – only
+        exact when the base is unrotated).
+        """
+        try:
+            if self._base_body_id is not None:
+                return self.data.cvel[self._base_body_id, 3:6].copy()
+        except Exception:
+            pass
         return self.data.qvel[:3].copy()
-    
+
     @property
     def base_ang_vel(self) -> np.ndarray:
-        """Get base angular velocity in world frame."""
-        return self.data.qvel[3:6].copy()
+        """Get base angular velocity in **world** frame.
+
+        Primary source: ``data.cvel`` (refreshed by :meth:`step` via
+        ``mj_forward`` after the decimation loop).
+        Fallback: rotate ``qvel[3:6]`` (body-frame) to world frame.
+        """
+        try:
+            if self._base_body_id is not None:
+                return self.data.cvel[self._base_body_id, 0:3].copy()
+        except Exception:
+            pass
+        # qvel[3:6] for a free joint is in the LOCAL (body) frame.
+        # Rotate to world frame so the caller (ObservationBuilder) can apply
+        # its own world→body rotation consistently.
+        from ..core.physics import quat_to_rotation_matrix
+        R = quat_to_rotation_matrix(self.base_quat)
+        return (R @ self.data.qvel[3:6]).copy()
     
     def reset(self, initial_state: dict[str, Any] | None = None) -> np.ndarray:
         """Reset simulation.
@@ -352,6 +556,11 @@ class BaseMujocoSimulator:
         """
         mujoco.mj_resetData(self.model, self.data)
         
+        # Track whether we changed joint pose without explicitly setting full qpos.
+        # If so, we will perform a conservative "spawn lift" to avoid starting with
+        # robot geoms interpenetrating the ground due to pose changes (common sim2sim instability source).
+        pose_touched = False
+
         if initial_state:
             if "qpos" in initial_state:
                 self.data.qpos[:] = initial_state["qpos"]
@@ -360,10 +569,12 @@ class BaseMujocoSimulator:
             if "joint_pos" in initial_state:
                 num_free_dof = 7 if self.model.nq > self.num_actions else 0
                 self.data.qpos[num_free_dof:num_free_dof + self.num_actions] = initial_state["joint_pos"]
+                pose_touched = True
         else:
             # Default: set joints to default positions
             for i, qpos_adr in enumerate(self._qpos_adrs):
                 self.data.qpos[qpos_adr] = float(self.default_joint_pos[i])
+            pose_touched = True
 
         # If we have a floating base and we're not explicitly overriding qpos, lift the root
         # to avoid starting with the feet embedded in a raised heightfield.
@@ -376,8 +587,40 @@ class BaseMujocoSimulator:
             if dz > 0.0:
                 self.data.qpos[2] = float(self.data.qpos[2]) + dz
         
-        # Forward kinematics
+        # Forward kinematics (needed before computing any spawn adjustments).
         mujoco.mj_forward(self.model, self.data)
+
+        # Conservative anti-interpenetration lift:
+        # When we set joints to a different default pose than the XML's initial pose,
+        # the base z in the XML may no longer keep the feet above the ground (z=0),
+        # causing explosive contacts and NaNs in QACC very early.
+        #
+        # We estimate the lowest point of each *robot* geom (exclude world geoms) as:
+        #   geom_xpos.z - max(geom_size)
+        # and lift the floating base if any are below a small clearance.
+        if has_floating_base and pose_touched and (not initial_state or "qpos" not in initial_state):
+            try:
+                clearance = 0.01  # meters
+                geom_xpos = np.asarray(self.data.geom_xpos, dtype=np.float64)
+                geom_size = np.asarray(self.model.geom_size, dtype=np.float64)
+                geom_bodyid = np.asarray(self.model.geom_bodyid, dtype=np.int64)
+                geom_contype = np.asarray(self.model.geom_contype, dtype=np.int64)
+                geom_conaff = np.asarray(self.model.geom_conaffinity, dtype=np.int64)
+
+                # Only consider *collidable* geoms attached to non-world bodies (robot bodies).
+                # This avoids over-lifting due to visual-only mesh geoms whose bounding sizes can be large.
+                robot_mask = (geom_bodyid > 0) & ((geom_contype != 0) | (geom_conaff != 0))
+                if np.any(robot_mask):
+                    sizes = geom_size[robot_mask]
+                    rad = np.max(sizes, axis=1)
+                    z_bottom_est = geom_xpos[robot_mask, 2] - rad
+                    min_z = float(np.min(z_bottom_est))
+                    if min_z < clearance:
+                        lift = float(clearance - min_z)
+                        self.data.qpos[2] = float(self.data.qpos[2]) + lift
+                        mujoco.mj_forward(self.model, self.data)
+            except Exception:
+                pass
         
         # Reset state
         self.episode_length = 0
@@ -433,7 +676,12 @@ class BaseMujocoSimulator:
             raise RuntimeError(
                 f"[Sim2Sim] Policy action_dim mismatch: got {action.shape[0]} expected {self.onnx_action_dim}"
             )
-        
+
+        # IsaacLab does NOT clip raw policy outputs to [-1, 1].
+        # The JointPositionAction term only applies a generous processed-action clip
+        # (e.g. [-100, 100]) after scale+offset, and the PhysX joint limits handle the rest.
+        # Clipping here would silently truncate large actions and destabilize the robot.
+
         # Store action for observation (ONNX order)
         self._last_action = action.copy()
 
@@ -443,21 +691,20 @@ class BaseMujocoSimulator:
         # Convert action to target positions
         target_q = self._action_to_target(action_act)
         
-        # Step physics with decimation
+        # Step physics with decimation.
+        # Actuators are configured as position servos – set ctrl to target positions.
+        self.data.ctrl[:self.num_actions] = target_q
         for _ in range(self.decimation):
-            # Compute PD torques
-            tau = self._compute_control(target_q)
-            
-            # Apply torques robustly: drive generalized forces directly at the joint dofs.
-            # This avoids common Unitree XML conventions that clamp data.ctrl to [-1,1] with gear=1.
-            self.data.ctrl[:] = 0.0
-            self.data.qfrc_applied[:] = 0.0
-            for i, dof_adr in enumerate(self._dof_adrs):
-                self.data.qfrc_applied[dof_adr] = float(tau[i])
-            
-            # Step physics
             mujoco.mj_step(self.model, self.data)
-        
+
+        # CRITICAL: mj_step leaves velocity-dependent derived quantities
+        # (data.cvel, data.subtree_linvel, …) stale – they reflect the state
+        # BEFORE the last integration.  Calling mj_forward refreshes them so
+        # that base_ang_vel / base_lin_vel (which read from data.cvel) are
+        # consistent with the current qvel.  Without this, the angular-velocity
+        # observation lags by one physics step, feeding the policy stale data.
+        mujoco.mj_forward(self.model, self.data)
+
         # Update state
         self.episode_length += 1
         self._update_phase()
@@ -492,8 +739,8 @@ class BaseMujocoSimulator:
         Returns:
             Target joint positions
         """
-        base = self.action_offset if np.any(self.action_offset) else self.default_joint_pos
-        return base + action * self.action_scale
+        base = self.action_offset if bool(getattr(self, "_action_offset_provided", False)) else self.default_joint_pos
+        return base + np.asarray(action, dtype=np.float32) * self.action_scale
     
     def _compute_control(self, target_q: np.ndarray) -> np.ndarray:
         """Compute PD control torques.

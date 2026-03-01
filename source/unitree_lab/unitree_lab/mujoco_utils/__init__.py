@@ -16,7 +16,7 @@ Architecture Overview:
 
 Usage:
     ```python
-    from unitree_rl_lab.mujoco_utils import BaseMujocoSimulator
+    from unitree_lab.mujoco_utils import BaseMujocoSimulator
     
     # Create simulator
     simulator = BaseMujocoSimulator(

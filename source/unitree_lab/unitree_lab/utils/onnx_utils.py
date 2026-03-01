@@ -222,9 +222,12 @@ def build_physics_spec(env) -> dict:
     decimation = env.cfg.decimation
     policy_dt = sim_dt * decimation
     
+    armature = asset.data.default_joint_armature[0].detach().cpu().numpy().tolist()
+
     return {
         "joint_stiffness": stiffness,
         "joint_damping": damping,
+        "joint_armature": armature,
         "default_joint_pos": default_joint_pos,
         "sim_dt": sim_dt,
         "decimation": decimation,

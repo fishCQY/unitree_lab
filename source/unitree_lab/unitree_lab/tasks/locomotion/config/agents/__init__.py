@@ -3,7 +3,6 @@
 from .rsl_rl_ppo_cfg import (
     ActorCriticDepthCfg,
     AMPCfg,
-    RslRlGuidanceCfg,
     RslRlPpoAlgorithmCfg,
     UnitreeG1RoughPPORunnerCfg,
     UnitreeG1FlatPPORunnerCfg,
@@ -14,7 +13,6 @@ from .rsl_rl_ppo_cfg import (
 __all__ = [
     "ActorCriticDepthCfg",
     "AMPCfg",
-    "RslRlGuidanceCfg",
     "RslRlPpoAlgorithmCfg",
     "UnitreeG1RoughPPORunnerCfg",
     "UnitreeG1FlatPPORunnerCfg",

@@ -48,7 +48,7 @@ class ExperimentConfig:
     # Code snapshot
     save_code: bool = True
     code_dirs: List[str] = field(default_factory=lambda: [
-        "source/unitree_rl_lab/unitree_rl_lab",
+        "source/unitree_lab/unitree_lab",
         "scripts",
     ])
     
@@ -187,7 +187,7 @@ class ExperimentTracker:
             from .wandb_utils import WandbManager, WandbConfig
             
             wandb_cfg = WandbConfig(
-                project="unitree_rl_lab",
+                project="unitree_lab",
                 name=f"{self.config.task}_{self.config.name}",
                 group=self.config.task,
                 tags=self.config.tags,

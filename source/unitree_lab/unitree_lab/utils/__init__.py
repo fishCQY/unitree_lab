@@ -1,4 +1,4 @@
-"""Utility functions for unitree_rl_lab.
+"""Utility functions for unitree_lab.
 
 This module provides utilities for:
 - AMP motion data loading and processing

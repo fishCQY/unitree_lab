@@ -37,42 +37,55 @@ class ActorCriticDepthCfg(RslRlPpoActorCriticCfg):
 
 
 @configclass
-class AMPCfg:
-    amp_reward_weight: float = MISSING
-    amp_lambda: float = MISSING
-    obs_history_len: int = MISSING
+class AMPDiscriminatorCfg:
+    """Sub-config passed as ``amp_discriminator`` to PPOAMP."""
     hidden_dims: list[int] = MISSING
-    partial_ids: list[int] = MISSING
-    offline_dataset_path: str = MISSING
-    lr_scale: float = MISSING
-    num_learning_epochs: int = MISSING
-    num_mini_batches: int = MISSING
-    add_noise: float = MISSING
-    noise_scale: list[float] | None = MISSING
-    activation: str = MISSING
-    normalization: bool = MISSING
+    activation: str = "relu"
+    style_reward_scale: float = 1.0
+    task_style_lerp: float = 0.5
 
 
 @configclass
-class RslRlGuidanceCfg:
-    experts_paths: list[str] = MISSING
-    loss_type: str = MISSING
-    loss_coeff: float = MISSING
+class AMPCfg:
+    """AMP configuration consumed by rsl_rl.algorithms.PPOAMP.
+
+    Fields ``disc_obs_dim``, ``disc_obs_steps``, and ``step_dt`` are
+    auto-resolved by ``resolve_amp_config`` at runtime — do NOT set them here.
+    """
+    loss_type: str = "LSGAN"
+    disc_learning_rate: float = 5e-4
+    disc_trunk_weight_decay: float = 1e-4
+    disc_linear_weight_decay: float = 1e-2
+    disc_max_grad_norm: float = 0.5
+    grad_penalty_scale: float = 10.0
+    disc_obs_buffer_size: int = 200
+    amp_discriminator: AMPDiscriminatorCfg = MISSING
 
 
 @configclass
 class RslRlPpoAlgorithmCfg(_RslRlPpoAlgorithmCfg):
     amp_cfg: AMPCfg | None = None
-    guidance_cfg: RslRlGuidanceCfg | None = None
+
+
+# =========================================================================
+# AMP Runner Configs (use rsl_rl AMPRunner)
+# =========================================================================
 
 
 @configclass
 class UnitreeG1RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    class_name = "AMPRunner"
     num_steps_per_env = 24
     max_iterations = 200000
     save_interval = 1000
     experiment_name = "unitree_g1_rough"
     empirical_normalization = True
+    obs_groups = {
+        "policy": ["policy"],
+        "critic": ["critic"],
+        "discriminator": ["disc_agent"],
+        "discriminator_demonstration": ["disc_demo"],
+    }
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_hidden_dims=[1024, 512, 256],
@@ -82,6 +95,7 @@ class UnitreeG1RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         critic_obs_normalization=True,
     )
     algorithm = RslRlPpoAlgorithmCfg(
+        class_name="PPOAMP",
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
@@ -95,36 +109,19 @@ class UnitreeG1RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
         amp_cfg=AMPCfg(
-            amp_reward_weight=0.5,
-            amp_lambda=10,
-            obs_history_len=2,
-            hidden_dims=[1024, 512],
-            partial_ids=list(range(0, 6)) + list(range(9, 67)),
-            offline_dataset_path=[
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B4_-_Stand_to_Walk_backwards_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B15_-__Walk_turn_around_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B10_-__Walk_turn_left_45_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B5_-__Walk_backwards_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B16_-_Walk_turn_change_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B23_-_Side_step_right_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B22_-_Side_step_left_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B11_-__Walk_turn_left_135_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B22_-__side_step_left_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B4_-_Stand_to_Walk_Back_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B10_-_Walk_turn_left_45_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B4_-_Stand_to_Walk_backwards_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B23_-__side_step_right_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B13_-_Walk_turn_right_45_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B13_-__Walk_turn_right_90_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B9_-__Walk_turn_left_90_stageii.pkl",
-            ],
-            lr_scale=0.5,
-            num_learning_epochs=1,
-            num_mini_batches=10,
-            add_noise=True,
-            noise_scale=[0.2] * 3 + [0.05] * 3 + [0.01] * 29 + [1.5] * 29,
-            activation="relu",
-            normalization=True,
+            loss_type="LSGAN",
+            disc_learning_rate=5e-4,
+            disc_trunk_weight_decay=1e-4,
+            disc_linear_weight_decay=1e-2,
+            disc_max_grad_norm=0.5,
+            grad_penalty_scale=10.0,
+            disc_obs_buffer_size=200,
+            amp_discriminator=AMPDiscriminatorCfg(
+                hidden_dims=[1024, 512],
+                activation="relu",
+                style_reward_scale=1.0,
+                task_style_lerp=0.5,
+            ),
         ),
     )
 
@@ -135,24 +132,6 @@ class UnitreeG1FlatPPORunnerCfg(UnitreeG1RoughPPORunnerCfg):
         super().__post_init__()
         self.max_iterations = 60000
         self.experiment_name = "unitree_g1_flat"
-        self.algorithm.amp_cfg.offline_dataset_path = [
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B4_-_Stand_to_Walk_backwards_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B15_-__Walk_turn_around_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B10_-__Walk_turn_left_45_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B5_-__Walk_backwards_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B16_-_Walk_turn_change_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B23_-_Side_step_right_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B22_-_Side_step_left_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B11_-__Walk_turn_left_135_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B22_-__side_step_left_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B4_-_Stand_to_Walk_Back_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B10_-_Walk_turn_left_45_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B4_-_Stand_to_Walk_backwards_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B23_-__side_step_right_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B13_-_Walk_turn_right_45_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B13_-__Walk_turn_right_90_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B9_-__Walk_turn_left_90_stageii.pkl",
-        ]
         self.policy.actor_hidden_dims = [512, 256, 128]
         self.policy.critic_hidden_dims = [512, 256, 128]
 
@@ -179,6 +158,7 @@ class UnitreeG1RoughPPORunnerGRUCfg(UnitreeG1RoughPPORunnerCfg):
 class UnitreeG1RoughDepthPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """PPO Runner with depth image encoder for visual locomotion."""
 
+    class_name = "AMPRunner"
     num_steps_per_env = 24
     max_iterations = 200000
     save_interval = 1000
@@ -188,6 +168,8 @@ class UnitreeG1RoughDepthPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         "policy": ["policy"],
         "critic": ["critic"],
         "image": ["image"],
+        "discriminator": ["disc_agent"],
+        "discriminator_demonstration": ["disc_demo"],
     }
     policy = ActorCriticDepthCfg(
         init_noise_std=1.0,
@@ -201,6 +183,7 @@ class UnitreeG1RoughDepthPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         critic_obs_normalization=True,
     )
     algorithm = RslRlPpoAlgorithmCfg(
+        class_name="PPOAMP",
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
@@ -214,35 +197,18 @@ class UnitreeG1RoughDepthPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
         amp_cfg=AMPCfg(
-            amp_reward_weight=0.5,
-            amp_lambda=10,
-            obs_history_len=2,
-            hidden_dims=[1024, 512],
-            partial_ids=list(range(0, 6)) + list(range(9, 67)),
-            offline_dataset_path=[
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B4_-_Stand_to_Walk_backwards_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B15_-__Walk_turn_around_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B10_-__Walk_turn_left_45_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B5_-__Walk_backwards_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B16_-_Walk_turn_change_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B23_-_Side_step_right_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B22_-_Side_step_left_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B11_-__Walk_turn_left_135_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B22_-__side_step_left_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B4_-_Stand_to_Walk_Back_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B10_-_Walk_turn_left_45_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B4_-_Stand_to_Walk_backwards_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B23_-__side_step_right_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/Walk_B13_-_Walk_turn_right_45_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B13_-__Walk_turn_right_90_stageii.pkl",
-                "source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run/B9_-__Walk_turn_left_90_stageii.pkl",
-            ],
-            lr_scale=0.5,
-            num_learning_epochs=1,
-            num_mini_batches=10,
-            add_noise=True,
-            noise_scale=[0.2] * 3 + [0.05] * 3 + [0.01] * 29 + [1.5] * 29,
-            activation="relu",
-            normalization=True,
+            loss_type="LSGAN",
+            disc_learning_rate=5e-4,
+            disc_trunk_weight_decay=1e-4,
+            disc_linear_weight_decay=1e-2,
+            disc_max_grad_norm=0.5,
+            grad_penalty_scale=10.0,
+            disc_obs_buffer_size=200,
+            amp_discriminator=AMPDiscriminatorCfg(
+                hidden_dims=[1024, 512],
+                activation="relu",
+                style_reward_scale=1.0,
+                task_style_lerp=0.5,
+            ),
         ),
     )

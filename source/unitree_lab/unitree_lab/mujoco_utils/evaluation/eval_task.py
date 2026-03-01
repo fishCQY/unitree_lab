@@ -108,7 +108,7 @@ LOCOMOTION_EVAL_TASKS = {
         name="rough_forward",
         description="Walk forward on rough terrain",
         # Align with IsaacLab "rough" semantics: use the SAME sub-terrain palette + proportions
-        # as unitree_rl_lab/terrain/rough.py -> HumanoidRoughTerrainsCfg (grid layout).
+        # as unitree_lab/terrain/rough.py -> HumanoidRoughTerrainsCfg (grid layout).
         terrain_type="mixed",
         terrain_config={
             "difficulty": 0.6,
@@ -213,7 +213,7 @@ LOCOMOTION_EVAL_TASKS = {
                 "pyramid_stairs_inv",
             ),
             # EXACT match to IsaacLab HumanoidRoughTerrainsCfg (keys + proportions):
-            # unitree_rl_lab/terrain/rough.py -> HumanoidRoughTerrainsCfg.sub_terrains
+            # unitree_lab/terrain/rough.py -> HumanoidRoughTerrainsCfg.sub_terrains
             # If you want stairs included, match HumanoidRoughTerrainsWithStairsCfg instead:
             # flat=0.10, stepping_stones=0.15, wave=0.15, cambered=0.15, pyramid=0.15,
             # rails=0.10, washboard=0.10, stairs_up=0.05, stairs_down=0.05
