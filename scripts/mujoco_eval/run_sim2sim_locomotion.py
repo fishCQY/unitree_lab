@@ -134,6 +134,217 @@ def _deploy_yaml_to_config_override(deploy: dict) -> dict[str, Any]:
     return override
 
 
+def _generate_course_xml(xml_path: Path, task: Any) -> tuple[Path, float]:
+    """Generate a temporary XML with box-geom course terrain inserted.
+
+    Returns (temp_xml_path, spawn_z_offset).  The caller should load the
+    returned XML instead of the original terrain XML.
+    """
+    import os
+    import tempfile
+    import xml.etree.ElementTree as ET
+
+    terrain_cfg = task.get_terrain_config()
+    segments = terrain_cfg.get("course_segments", ())
+    step_h = float(terrain_cfg.get("step_height", 0.05))
+    step_w = float(terrain_cfg.get("step_width", 0.50))
+    slope_angle = float(terrain_cfg.get("slope_angle", 0.15))
+    platform_h = float(terrain_cfg.get("course_platform_height", 0.50))
+    noise_amp = 0.0
+    nr = terrain_cfg.get("noise_range", (-0.01, 0.01))
+    if nr:
+        noise_amp = max(abs(nr[0]), abs(nr[1]))
+    half_y = 3.0  # half-width in Y direction
+
+    total_len = sum(s[1] for s in segments)
+
+    tree = ET.parse(str(xml_path))
+    root = tree.getroot()
+
+    xml_dir = xml_path.parent
+
+    # Remove heightfield asset + geom (we'll use boxes instead).
+    asset_el = root.find("asset")
+    if asset_el is not None:
+        for hf in list(asset_el.findall("hfield")):
+            asset_el.remove(hf)
+
+    wb = root.find("worldbody")
+    if wb is not None:
+        for g in list(wb.findall("geom")):
+            if g.get("type") == "hfield":
+                wb.remove(g)
+    else:
+        wb = ET.SubElement(root, "worldbody")
+
+    # Ensure groundplane material exists
+    if asset_el is None:
+        asset_el = ET.SubElement(root, "asset")
+
+    # Add a flat ground plane at z=0 as fallback (prevents falling through gaps).
+    gp = ET.SubElement(wb, "geom")
+    gp.set("name", "ground_plane")
+    gp.set("type", "plane")
+    gp.set("size", f"{total_len} {half_y + 1} 0.01")
+    gp.set("material", "groundplane")
+    gp.set("friction", "1 0.005 0.0001")
+    gp.set("contype", "1")
+    gp.set("conaffinity", "1")
+
+    # Build course along +X, origin at center.
+    x_start = -total_len / 2.0
+    cur_x = x_start
+    cur_h = 0.0
+    geom_idx = 0
+    spawn_z = 0.5  # default
+
+    for seg_type, seg_len in segments:
+        seg_type = seg_type.strip().lower()
+
+        if seg_type in ("flat", "platform"):
+            # A solid box spanning the segment.
+            if cur_h > 0.001:
+                bx = ET.SubElement(wb, "geom")
+                bx.set("name", f"course_{geom_idx}")
+                bx.set("type", "box")
+                bx.set("size", f"{seg_len / 2} {half_y} {cur_h / 2}")
+                bx.set("pos", f"{cur_x + seg_len / 2} 0 {cur_h / 2}")
+                bx.set("friction", "1 0.005 0.0001")
+                bx.set("contype", "1")
+                bx.set("conaffinity", "1")
+                bx.set("rgba", "0.35 0.45 0.55 1")
+                geom_idx += 1
+            cur_x += seg_len
+
+        elif seg_type == "slope_up":
+            rise = min(seg_len * np.tan(slope_angle), platform_h - cur_h)
+            rise = max(rise, 0.0)
+            # Approximate slope with many thin slices (solid boxes).
+            n_slices = max(1, int(seg_len / 0.10))  # ~10cm per slice
+            slice_w = seg_len / n_slices
+            for sl in range(n_slices):
+                frac = (sl + 1) / n_slices
+                top_h = cur_h + frac * rise
+                sx_pos = cur_x + sl * slice_w + slice_w / 2
+                bx = ET.SubElement(wb, "geom")
+                bx.set("name", f"course_{geom_idx}")
+                bx.set("type", "box")
+                bx.set("size", f"{slice_w / 2} {half_y} {top_h / 2}")
+                bx.set("pos", f"{sx_pos} 0 {top_h / 2}")
+                bx.set("friction", "1 0.005 0.0001")
+                bx.set("contype", "1")
+                bx.set("conaffinity", "1")
+                bx.set("rgba", "0.3 0.5 0.4 1")
+                geom_idx += 1
+            cur_h += rise
+            cur_x += seg_len
+
+        elif seg_type == "slope_down":
+            drop = min(seg_len * np.tan(slope_angle), cur_h)
+            drop = max(drop, 0.0)
+            n_slices = max(1, int(seg_len / 0.10))
+            slice_w = seg_len / n_slices
+            for sl in range(n_slices):
+                frac = (sl + 1) / n_slices
+                top_h = cur_h - frac * drop
+                top_h = max(top_h, 0.001)
+                sx_pos = cur_x + sl * slice_w + slice_w / 2
+                bx = ET.SubElement(wb, "geom")
+                bx.set("name", f"course_{geom_idx}")
+                bx.set("type", "box")
+                bx.set("size", f"{slice_w / 2} {half_y} {top_h / 2}")
+                bx.set("pos", f"{sx_pos} 0 {top_h / 2}")
+                bx.set("friction", "1 0.005 0.0001")
+                bx.set("contype", "1")
+                bx.set("conaffinity", "1")
+                bx.set("rgba", "0.3 0.5 0.4 1")
+                geom_idx += 1
+            cur_h -= drop
+            cur_h = max(cur_h, 0.0)
+            cur_x += seg_len
+
+        elif seg_type == "stairs_up":
+            target_rise = min(platform_h - cur_h, platform_h)
+            target_rise = max(target_rise, 0.0)
+            n_steps = max(1, round(target_rise / step_h)) if step_h > 1e-6 else 1
+            actual_step_w = seg_len / n_steps
+            for s in range(n_steps):
+                sh = cur_h + (s + 1) * step_h
+                sx_pos = cur_x + s * actual_step_w + actual_step_w / 2
+                bx = ET.SubElement(wb, "geom")
+                bx.set("name", f"course_{geom_idx}")
+                bx.set("type", "box")
+                bx.set("size", f"{actual_step_w / 2} {half_y} {sh / 2}")
+                bx.set("pos", f"{sx_pos} 0 {sh / 2}")
+                bx.set("friction", "1 0.005 0.0001")
+                bx.set("contype", "1")
+                bx.set("conaffinity", "1")
+                bx.set("rgba", "0.4 0.45 0.5 1")
+                geom_idx += 1
+            cur_h += n_steps * step_h
+            cur_x += seg_len
+
+        elif seg_type == "stairs_down":
+            target_drop = min(cur_h, platform_h)
+            target_drop = max(target_drop, 0.0)
+            n_steps = max(1, round(target_drop / step_h)) if step_h > 1e-6 else 1
+            actual_step_w = seg_len / n_steps
+            for s in range(n_steps):
+                sh = cur_h - (s + 1) * step_h
+                sh = max(sh, 0.0)
+                sx_pos = cur_x + s * actual_step_w + actual_step_w / 2
+                box_h = sh if sh > 0.001 else 0.001
+                bx = ET.SubElement(wb, "geom")
+                bx.set("name", f"course_{geom_idx}")
+                bx.set("type", "box")
+                bx.set("size", f"{actual_step_w / 2} {half_y} {box_h / 2}")
+                bx.set("pos", f"{sx_pos} 0 {box_h / 2}")
+                bx.set("friction", "1 0.005 0.0001")
+                bx.set("contype", "1")
+                bx.set("conaffinity", "1")
+                bx.set("rgba", "0.4 0.45 0.5 1")
+                geom_idx += 1
+            cur_h -= n_steps * step_h
+            cur_h = max(cur_h, 0.0)
+            cur_x += seg_len
+
+        elif seg_type == "rough":
+            # Rough ground: small random boxes on the ground plane.
+            rng = np.random.default_rng(42 + geom_idx)
+            n_bumps = int(seg_len * half_y * 2 * 2)  # ~2 bumps per m²
+            for _ in range(n_bumps):
+                bw = rng.uniform(0.08, 0.20)
+                bh_val = rng.uniform(0.002, noise_amp * 2) if noise_amp > 0 else 0.005
+                bx_pos = cur_x + rng.uniform(0, seg_len)
+                by_pos = rng.uniform(-half_y, half_y)
+                bz_pos = cur_h + bh_val / 2
+                bump = ET.SubElement(wb, "geom")
+                bump.set("name", f"course_bump_{geom_idx}")
+                bump.set("type", "box")
+                bump.set("size", f"{bw/2} {bw/2} {bh_val/2}")
+                bump.set("pos", f"{bx_pos} {by_pos} {bz_pos}")
+                bump.set("friction", "1 0.005 0.0001")
+                bump.set("contype", "1")
+                bump.set("conaffinity", "1")
+                bump.set("rgba", "0.3 0.4 0.5 1")
+                geom_idx += 1
+            cur_x += seg_len
+
+        else:
+            cur_x += seg_len
+
+    # Spawn at x=0 (centre).  The flat segment is designed to cover x=0.
+    # Ground plane is at z=0, so robot spawns on it.
+    spawn_z = 0.5
+
+    # Write temporary XML in same directory as source so relative includes/meshdir work.
+    fd, tmp_path = tempfile.mkstemp(suffix=".xml", prefix="course_terrain_", dir=str(xml_dir))
+    os.close(fd)
+    tree.write(tmp_path, encoding="unicode", xml_declaration=True)
+    print(f"[Terrain] Generated course XML with {geom_idx} geoms -> {tmp_path}")
+    return Path(tmp_path), spawn_z
+
+
 def _setup_terrain(
     simulator: Any,
     task: Any,
@@ -180,20 +391,33 @@ def _setup_terrain(
     generator.nx = ncol
     generator.ny = nrow
     generator.generate()
+
+    # Record min height before injection (injection shifts min to 0).
+    hf = generator.heightfield
+    min_h = float(np.min(hf)) if hf is not None and hf.size else 0.0
+    shift = -min_h if min_h < 0.0 else 0.0
+
     setup_terrain_data_in_model(simulator.model, generator, hfield_name=hfield_name)
 
-    spawn_z = generator.get_spawn_height(0.0, 0.0)
+    # spawn_z uses the pre-shift heightfield; correct for the shift applied during injection.
+    raw_spawn_z = generator.get_spawn_height(0.0, 0.0)
+    spawn_z = raw_spawn_z + shift
     return max(0.0, spawn_z)
 
 
 class KeyboardTeleop:
     """Keyboard velocity command controller for the MuJoCo viewer.
 
-    Uses GLFW key codes (passed by mujoco.viewer's key_callback):
-      W/S  -> vx (forward/backward)
-      A/D  -> vy (left/right)
-      Q/E  -> wz (yaw left/right)
-      SPACE -> zero all
+    Uses arrow keys / Page keys (GLFW key codes) to avoid conflicts with
+    MuJoCo viewer's built-in shortcuts (W=wireframe, S=shadow, A=autoconnect,
+    D=static body, Q=camera, E=equality — all toggle rendering flags).
+
+    Key bindings:
+      UP/DOWN      -> vx (forward/backward)
+      LEFT/RIGHT   -> wz (yaw left/right)
+      PgUp/PgDn    -> vy (lateral left/right)
+      Keypad +/−   -> spawn z offset +0.5 / −0.5 (per press)
+      Backspace    -> zero velocity (vx, vy, wz)
 
     IMPORTANT: ``handle_key`` is invoked from the GLFW render thread.
     All I/O (print, logging) is deferred to the main simulation thread via
@@ -203,19 +427,21 @@ class KeyboardTeleop:
 
     VX_STEP = 0.1
     VY_STEP = 0.1
-    WZ_STEP = 0.1
-    VX_RANGE = (-1.0, 2.0)
-    VY_RANGE = (-0.6, 0.6)
-    WZ_RANGE = (-1.0, 1.0)
+    WZ_STEP = 0.5
+    VX_RANGE = (-2.0, 2.0)
+    VY_RANGE = (-0.0, 0.0)
+    WZ_RANGE = (-2.0, 2.0)
 
-    # GLFW key codes (portable, no glfw import needed at class level)
-    _KEY_W = 87
-    _KEY_S = 83
-    _KEY_A = 65
-    _KEY_D = 68
-    _KEY_Q = 81
-    _KEY_E = 69
-    _KEY_SPACE = 32
+    # GLFW key codes — arrow keys + page keys don't conflict with MuJoCo viewer
+    _KEY_UP = 265
+    _KEY_DOWN = 264
+    _KEY_LEFT = 263
+    _KEY_RIGHT = 262
+    _KEY_PAGE_UP = 266
+    _KEY_PAGE_DOWN = 267
+    _KEY_BACKSPACE = 259
+    _KEY_KP_ADD = 334
+    _KEY_KP_SUBTRACT = 333
 
     def __init__(self) -> None:
         self.vx = 0.0
@@ -229,26 +455,26 @@ class KeyboardTeleop:
 
         Called from the GLFW render thread – must NOT do any I/O here.
         """
-        if key == self._KEY_W:
+        if key == self._KEY_UP:
             self.vx = min(self.vx + self.VX_STEP, self.VX_RANGE[1])
-        elif key == self._KEY_S:
+        elif key == self._KEY_DOWN:
             self.vx = max(self.vx - self.VX_STEP, self.VX_RANGE[0])
-        elif key == self._KEY_A:
+        elif key == self._KEY_PAGE_UP:
             self.vy = min(self.vy + self.VY_STEP, self.VY_RANGE[1])
-        elif key == self._KEY_D:
+        elif key == self._KEY_PAGE_DOWN:
             self.vy = max(self.vy - self.VY_STEP, self.VY_RANGE[0])
-        elif key == self._KEY_Q:
+        elif key == self._KEY_LEFT:
             self.wz = min(self.wz + self.WZ_STEP, self.WZ_RANGE[1])
-        elif key == self._KEY_E:
+        elif key == self._KEY_RIGHT:
             self.wz = max(self.wz - self.WZ_STEP, self.WZ_RANGE[0])
-        elif key == self._KEY_SPACE:
+        elif key == self._KEY_BACKSPACE:
             self.vx = self.vy = self.wz = 0.0
         else:
             return
 
         self._dirty = True
         self._pending_msg = (
-            f"[Teleop] vx={self.vx:+.1f}  vy={self.vy:+.1f}  wz={self.wz:+.1f}"
+            f"[Teleop] vx={self.vx:+.1f}  vy={self.vy:+.1f}  wz={self.wz:+.1f} "
         )
 
     def flush_msg(self) -> None:
@@ -278,7 +504,7 @@ def _build_overlay_text(
     if teleop is not None:
         vx, vy, wz = teleop.command
         cmd_left = "Velocity Cmd\nvx\nvy\nwz"
-        cmd_right = f"(W/S A/D Q/E)\n{vx:+.2f} m/s\n{vy:+.2f} m/s\n{wz:+.2f} rad/s"
+        cmd_right = f"(Arrow/PgUp/PgDn)\n{vx:+.2f} m/s\n{vy:+.2f} m/s\n{wz:+.2f} rad/s"
     else:
         vx, vy, wz = simulator.velocity_command
         cmd_left = "Velocity Cmd\nvx\nvy\nwz"
@@ -309,6 +535,7 @@ def run_interactive(
     follow: bool = False,
     velocity: tuple[float, float, float] | None = None,
     max_steps_per_episode: int = 1000,
+    initial_spawn_z: float = 0.0,
 ) -> None:
     """Run interactive sim2sim with MuJoCo viewer.
 
@@ -327,7 +554,7 @@ def run_interactive(
         if velocity:
             teleop_ctrl.vx, teleop_ctrl.vy, teleop_ctrl.wz = velocity
         key_callback = teleop_ctrl.handle_key
-        print("[Teleop] Keyboard controls: W/S=vx, A/D=vy, Q/E=wz, SPACE=zero")
+        print("[Teleop] Keyboard: UP/DOWN=vx, PgUp/PgDn=vy, LEFT/RIGHT=wz, Keypad+/-=z+0.5, Backspace=zero vel")
 
     if velocity and teleop != "keyboard":
         simulator.set_velocity_command(*velocity)
@@ -349,6 +576,8 @@ def run_interactive(
 
     try:
         while viewer.is_running():
+            if teleop_ctrl is not None:
+                simulator.spawn_root_z_offset = initial_spawn_z 
             simulator.reset()
             if teleop_ctrl is not None:
                 simulator.set_velocity_command(*teleop_ctrl.command)
@@ -460,7 +689,9 @@ def run_headless(
     }
 
     if save_video:
-        _record_video_headless(simulator, task, output_dir, video_steps)
+        video_path = _record_video_headless(simulator, task, output_dir, video_steps)
+        if video_path:
+            summary["video"] = video_path
 
     return summary
 
@@ -471,7 +702,11 @@ def _record_video_headless(
     output_dir: str,
     duration_steps: int = 500,
 ) -> str | None:
-    """Record an evaluation video without a viewer window."""
+    """Record an evaluation video without a viewer window.
+
+    Uses a tracking camera that follows the robot, matching what you see
+    in the interactive ``run_interactive`` viewer with ``--follow``.
+    """
     try:
         import cv2
         import mujoco
@@ -483,7 +718,25 @@ def _record_video_headless(
     out_path.mkdir(parents=True, exist_ok=True)
 
     width, height = 1280, 720
+    if simulator.model.vis.global_.offwidth < width:
+        simulator.model.vis.global_.offwidth = width
+    if simulator.model.vis.global_.offheight < height:
+        simulator.model.vis.global_.offheight = height
     renderer = mujoco.Renderer(simulator.model, height, width)
+
+    # Setup a tracking camera that follows the robot base body.
+    cam = mujoco.MjvCamera()
+    cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+    # Track the robot's torso / floating-base body.
+    base_body_id = getattr(simulator, "_base_body_id", None)
+    if base_body_id is not None and base_body_id > 0:
+        cam.trackbodyid = base_body_id
+    else:
+        cam.trackbodyid = 1
+    cam.distance = 3.0
+    cam.azimuth = -150
+    cam.elevation = -20
+    cam.lookat[:] = [0, 0, 0.8]
 
     simulator.reset()
     vel_cmd = getattr(task, "velocity_command", (0.5, 0.0, 0.0))
@@ -491,7 +744,7 @@ def _record_video_headless(
 
     frames: list[np.ndarray] = []
     for _ in range(duration_steps):
-        renderer.update_scene(simulator.data)
+        renderer.update_scene(simulator.data, camera=cam)
         frame = renderer.render()
         frames.append(frame)
         simulator.step()
@@ -504,7 +757,6 @@ def _record_video_headless(
         writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     writer.release()
 
-    # Best-effort transcode to H.264
     try:
         import subprocess
 
@@ -648,6 +900,14 @@ def main() -> None:
         except Exception as e:
             print(f"[Warning] Failed to parse --config-override: {e}")
 
+    # For course terrain, generate a temporary XML with box geoms before loading.
+    course_spawn_z = 0.0
+    _tmp_xml: Path | None = None
+    if uses_terrain and task.terrain_type == "course" and (not bool(args.skip_terrain_inject)):
+        xml_path, course_spawn_z = _generate_course_xml(xml_path, task)
+        _tmp_xml = xml_path
+        uses_terrain = False  # terrain is already baked into the XML
+
     # Create simulator
     from unitree_lab.mujoco_utils.simulation.base_simulator import BaseMujocoSimulator
 
@@ -656,6 +916,10 @@ def main() -> None:
         onnx_path=str(onnx_path),
         config_override=config_override if config_override else None,
     )
+
+    if course_spawn_z > 0:
+        simulator.spawn_root_z_offset = course_spawn_z
+        print(f"[Sim2Sim] Course terrain spawn z-offset: {course_spawn_z:.2f}m")
 
     # Setup terrain if needed (unless user wants to use XML terrain as-is)
     if uses_terrain and (not bool(args.skip_terrain_inject)):
@@ -680,6 +944,7 @@ def main() -> None:
             follow=args.follow,
             velocity=velocity,
             max_steps_per_episode=max_steps,
+            initial_spawn_z=getattr(simulator, "spawn_root_z_offset", 0.0),
         )
     else:
         summary = run_headless(
@@ -690,7 +955,20 @@ def main() -> None:
             output_dir=args.output_dir,
             video_steps=args.video_steps,
         )
-        print(f"\n[Result] {summary}")
+        print(f"\nTask: {summary['task']}")
+        print(f"  Episodes:         {summary['num_episodes']}")
+        print(f"  Survival rate:    {summary['survival_rate']:.1f}%")
+        print(f"  Mean vel error:   {summary['mean_velocity_error']:.3f} m/s")
+        print(f"  Mean fwd dist:    {summary['mean_forward_distance']:.2f} m")
+        if "video" in summary:
+            print(f"  Video:            {summary['video']}")
+
+    # Clean up temporary XML.
+    if _tmp_xml is not None:
+        try:
+            _tmp_xml.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

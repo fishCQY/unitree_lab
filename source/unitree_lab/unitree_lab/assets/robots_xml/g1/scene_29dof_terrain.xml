@@ -17,9 +17,9 @@
 
     <!--
       Heightfield for sim2sim terrains (overwritten at runtime).
-      Sized for real-time rendering: 40m x 32m at ~0.1m resolution.
+      30m x 10m at ~0.1m resolution.
     -->
-    <hfield name="terrain_hfield" nrow="321" ncol="401" size="20 16 1.0 0.001"/>
+    <hfield name="terrain_hfield" nrow="101" ncol="301" size="15 5 1.0 0.001"/>
   </asset>
 
   <worldbody>

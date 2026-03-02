@@ -156,42 +156,29 @@ def setup_terrain_data_in_model(
     hfield_adr = model.hfield_adr[hfield_id]
     hfield_size = model.hfield_nrow[hfield_id] * model.hfield_ncol[hfield_id]
     
-    # Convert height values in meters -> MuJoCo hfield_data in [0,1] using the model's hfield size.
-    # MuJoCo uses: height(x,y) = base + size_z * hfield_data(x,y).
-    try:
-        size_z = float(model.hfield_size[hfield_id, 2])
-        base_z = float(model.hfield_size[hfield_id, 3])
-    except Exception:
-        size_z = 0.0
-        base_z = 0.0
+    # MuJoCo heightfield formula: physical_z = base_z + size_z * data[i]
+    # where data[i] is in [0, 1].
+    #
+    # To get exact physical heights we dynamically set size_z = max(heights)
+    # and base_z = 0, then normalize heights into [0, 1].
+    heights = np.asarray(hfield_data, dtype=np.float32)
+    min_h = float(np.min(heights)) if heights.size else 0.0
+    max_h = float(np.max(heights)) if heights.size else 0.0
 
-    if size_z > 1e-9:
-        # First, fit heights into the representable range [base_z, base_z + size_z]
-        # to avoid hard clipping (which would flatten negative roughness).
-        heights = np.asarray(hfield_data, dtype=np.float32)
-        min_h = float(np.min(heights)) if heights.size else 0.0
-        max_h = float(np.max(heights)) if heights.size else 0.0
+    # Shift so minimum is 0 (MuJoCo hfield can't represent negative heights).
+    if min_h < 0.0:
+        heights = heights - min_h
+        max_h = max_h - min_h
 
-        # Shift up if below base (common for symmetric noise ranges like [-a, a])
-        if min_h < base_z:
-            heights = heights + (base_z - min_h)
-            max_h = float(np.max(heights)) if heights.size else base_z
+    # Update model's hfield size_z and base_z so physical heights are exact.
+    actual_range = max(max_h, 1e-4)
+    model.hfield_size[hfield_id, 2] = actual_range  # size_z
+    model.hfield_size[hfield_id, 3] = 0.0           # base_z
 
-        # Scale down if above max
-        max_allowed = base_z + size_z
-        if max_h > max_allowed and max_h > base_z + 1e-9:
-            scale = (max_allowed - base_z) / (max_h - base_z)
-            heights = base_z + (heights - base_z) * float(scale)
+    # Normalize to [0, 1]
+    normalized = heights / actual_range
+    normalized = np.clip(normalized, 0.0, 1.0)
 
-        normalized = (heights - base_z) / size_z
-        normalized = np.clip(normalized, 0.0, 1.0)
-    else:
-        # Fallback (shouldn't happen): normalize by min/max to avoid crashing.
-        if hfield_data.max() > hfield_data.min():
-            normalized = (hfield_data - hfield_data.min()) / (hfield_data.max() - hfield_data.min())
-        else:
-            normalized = np.zeros_like(hfield_data)
-    
     # Write to model
     model.hfield_data[hfield_adr:hfield_adr + hfield_size] = normalized
 

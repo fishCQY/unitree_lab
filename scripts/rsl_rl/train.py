@@ -46,6 +46,10 @@ parser.add_argument(
     help="Path to MuJoCo XML for sim2sim (default: auto-detect from unitree_lab assets).",
 )
 parser.add_argument("--sim2sim_every", type=int, default=1, help="Run sim2sim every N checkpoint saves.")
+parser.add_argument(
+    "--sim2sim_task", type=str, default="rough_forward",
+    help="Eval task for sim2sim (e.g. flat_forward, rough_forward). Default: rough_forward.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -214,12 +218,26 @@ def _build_deploy_yaml_from_metadata(meta: dict) -> dict:
     return deploy
 
 
-def _find_sim2sim_resources():
-    """Locate the sim2sim script and default G1 XML from unitree_lab."""
+def _find_sim2sim_resources(task: str = "flat_forward"):
+    """Locate the sim2sim script and appropriate G1 XML from unitree_lab.
+
+    For terrain tasks (rough_forward, stairs_*, slope_*, mixed_terrain) the
+    terrain XML is preferred so that ``run_sim2sim_locomotion.py`` can inject
+    course/heightfield geometry.  For flat tasks the plain scene XML is used.
+    """
     rl_lab_root = Path.home() / "unitree_lab"
     script = rl_lab_root / "scripts" / "mujoco_eval" / "run_sim2sim_locomotion.py"
-    # Keep this aligned with scripts/mujoco_eval/run_sim2sim_locomotion.py -> find_robot_xml()
-    xml = rl_lab_root / "source" / "unitree_lab" / "unitree_lab" / "assets" / "robots_xml" / "g1" / "scene_29dof.xml"
+
+    xml_dir = rl_lab_root / "source" / "unitree_lab" / "unitree_lab" / "assets" / "robots_xml" / "g1"
+    flat_xml = xml_dir / "scene_29dof.xml"
+    terrain_xml = xml_dir / "scene_29dof_terrain.xml"
+
+    _TERRAIN_TASKS = {"rough_forward", "stairs_up", "stairs_down", "slope_up", "mixed_terrain"}
+    if task in _TERRAIN_TASKS and terrain_xml.exists():
+        xml = terrain_xml
+    else:
+        xml = flat_xml
+
     return script if script.exists() else None, xml if xml.exists() else None
 
 
@@ -348,7 +366,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # eval in a subprocess -> upload the video to W&B.
     # -------------------------------------------------------------------------
     sim2sim_enabled = bool(getattr(args_cli, "sim2sim", False))
-    sim2sim_script, sim2sim_default_xml = _find_sim2sim_resources()
+    sim2sim_task = str(getattr(args_cli, "sim2sim_task", "rough_forward"))
+    sim2sim_script, sim2sim_default_xml = _find_sim2sim_resources(task=sim2sim_task)
     sim2sim_jobs: queue.Queue = queue.Queue()
     sim2sim_sema = threading.BoundedSemaphore(value=1)
 
@@ -366,9 +385,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if proc is None:
                 continue
             proc.wait()
+            it = int(job.get("it", 0))
+            rc = proc.returncode
+            if rc != 0:
+                log_path = job.get("out_dir", "")
+                print(f"[Sim2Sim][WARN] subprocess exited with code {rc} (it={it}). Check {log_path}/sim2sim.log")
             mp4_path = job.get("mp4_path")
             if mp4_path and os.path.isfile(mp4_path):
-                _log_sim2sim_video_to_wandb(mp4_path, int(job.get("it", 0)))
+                _log_sim2sim_video_to_wandb(mp4_path, it)
+                print(f"[Sim2Sim] Video uploaded to W&B (it={it}): {mp4_path}")
+            elif mp4_path:
+                print(f"[Sim2Sim][WARN] Video not found (it={it}): {mp4_path}")
             try:
                 lf = job.get("log_f")
                 if lf:
@@ -446,21 +473,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         duration = float(getattr(args_cli, "sim2sim_duration", 5.0))
         max_steps = int(duration / 0.02)  # ~50Hz policy rate -> 250 steps for 5s
-        mp4_path = os.path.join(out_dir, "flat_forward_eval.mp4")
+        mp4_path = os.path.join(out_dir, f"{sim2sim_task}_sim2sim.mp4")
         sim2sim_log = os.path.join(out_dir, "sim2sim.log")
 
+        deploy_yaml_path = os.path.join(export_dir, "deploy_latest.yaml")
         cmd = [
             sys.executable, str(sim2sim_script),
             "--robot", str(getattr(args_cli, "sim2sim_robot", "g1")),
             "--onnx", str(onnx_path),
             "--xml", str(xml_path),
-            "--task", "flat_forward",
+            "--task", sim2sim_task,
             "--num-episodes", "1",
             "--max-steps", str(max_steps),
             "--output-dir", str(out_dir),
             "--save-video",
             "--video-steps", str(max_steps),
         ]
+        if os.path.isfile(deploy_yaml_path):
+            cmd += ["--deploy-yaml", deploy_yaml_path]
 
         try:
             log_f = open(sim2sim_log, "w")
@@ -481,7 +511,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
     finally:
         if sim2sim_thread is not None:
+            # Signal poller to exit, then wait for any in-flight sim2sim job to finish
+            # so the video is uploaded to W&B before we tear down the run.
             sim2sim_jobs.put(None)
+            sim2sim_thread.join(timeout=120)
+            if sim2sim_thread.is_alive():
+                print("[Sim2Sim][WARN] Poller thread still alive after 120s timeout.")
         # finalize W&B if active
         try:
             writer = getattr(getattr(runner, "logger", None), "writer", None)

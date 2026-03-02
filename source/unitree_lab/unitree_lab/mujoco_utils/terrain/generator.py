@@ -44,6 +44,10 @@ class TerrainType(Enum):
     # into one heightfield (useful for sim2sim "rough" tasks).
     MIXED = "mixed"
 
+    # A linear obstacle course along +X with height-continuous transitions:
+    # rough → slope_up → platform → stairs_down → rough → stairs_up → platform → slope_down → rough
+    COURSE = "course"
+
 
 @dataclass
 class TerrainConfig:
@@ -138,6 +142,23 @@ class TerrainConfig:
     mixed_spawn_flat: bool = True
     mixed_spawn_flat_halfwidth: float = 1.2  # meters (square patch centered at origin)
 
+    # Course terrain (sequential obstacle course along +X)
+    # Sequence of segments; each is (type, length_meters).
+    # Supported segment types: "rough", "slope_up", "slope_down",
+    #                          "stairs_up", "stairs_down", "platform"
+    course_segments: tuple[tuple[str, float], ...] = (
+        ("rough", 2.0),
+        ("slope_up", 2.0),
+        ("platform", 1.0),
+        ("stairs_down", 2.0),
+        ("rough", 2.0),
+        ("stairs_up", 2.0),
+        ("platform", 1.0),
+        ("slope_down", 2.0),
+        ("rough", 2.0),
+    )
+    course_platform_height: float = 0.3  # height of elevated platforms (meters)
+
 
 class MujocoTerrainGenerator:
     """Generator for MuJoCo heightfield terrains.
@@ -222,6 +243,8 @@ class MujocoTerrainGenerator:
             return self._generate_washboard()
         if terrain_type == TerrainType.MIXED:
             return self._generate_mixed(rng=rng)
+        if terrain_type == TerrainType.COURSE:
+            return self._generate_course(rng=rng)
         return self._generate_flat()
     
     def _generate_flat(self) -> np.ndarray:
@@ -246,8 +269,15 @@ class MujocoTerrainGenerator:
             factor = cfg.horizontal_scale / cfg.downsampled_scale
             heights_small = zoom(heights, factor, order=1)
             heights = zoom(heights_small, 1/factor, order=1)
-            # Ensure correct size
-            heights = heights[:self.ny, :self.nx]
+            # zoom can produce ±1 size differences; pad or clip to exact shape.
+            if heights.shape[0] < self.ny or heights.shape[1] < self.nx:
+                padded = np.zeros((self.ny, self.nx), dtype=heights.dtype)
+                sy = min(heights.shape[0], self.ny)
+                sx = min(heights.shape[1], self.nx)
+                padded[:sy, :sx] = heights[:sy, :sx]
+                heights = padded
+            else:
+                heights = heights[:self.ny, :self.nx]
         
         return heights
     
@@ -505,13 +535,19 @@ class MujocoTerrainGenerator:
         def _get_map(tt: str) -> np.ndarray:
             if tt in maps:
                 return maps[tt]
-            # Make per-type RNG stable relative to base RNG stream.
             child = np.random.default_rng(rng.integers(0, 2**32 - 1))
             try:
                 t = TerrainType(tt)
             except Exception:
                 t = TerrainType.FLAT
             m = self._generate_raw(terrain_type=t, rng=child)
+            # Guard against shape mismatches from zoom / rounding.
+            if m.shape != (self.ny, self.nx):
+                padded = np.zeros((self.ny, self.nx), dtype=np.float32)
+                sy = min(m.shape[0], self.ny)
+                sx = min(m.shape[1], self.nx)
+                padded[:sy, :sx] = m[:sy, :sx]
+                m = padded
             maps[tt] = m
             return m
 
@@ -650,6 +686,114 @@ class MujocoTerrainGenerator:
 
         return out.astype(np.float32)
     
+    def _generate_course(self, rng: np.random.Generator) -> np.ndarray:
+        """Generate a sequential obstacle course along +X with continuous height transitions.
+
+        The heightfield is built column-by-column (along X). Each segment type
+        produces heights that start where the previous segment ended, ensuring
+        seamless transitions.
+        """
+        cfg = self.config
+        segments = cfg.course_segments
+        if not segments:
+            return self._generate_flat()
+
+        total_length = sum(seg[1] for seg in segments)
+        # Scale segment lengths proportionally to fit the heightfield width.
+        scale_x = cfg.size[0] / total_length if total_length > 0 else 1.0
+
+        heights = np.zeros((self.ny, self.nx), dtype=np.float32)
+
+        cur_x = 0  # current column index
+        cur_h = 0.0  # running height at the right edge of the last segment
+        step_h = cfg.step_height
+        step_w = cfg.step_width
+        slope_angle = cfg.slope_angle
+        platform_h = cfg.course_platform_height
+        h_scale = cfg.horizontal_scale
+
+        for seg_type, seg_len in segments:
+            seg_type = seg_type.strip().lower()
+            seg_len_scaled = seg_len * scale_x
+            seg_samples = max(1, int(round(seg_len_scaled / h_scale)))
+            x_end = min(self.nx, cur_x + seg_samples)
+            actual_samples = x_end - cur_x
+            if actual_samples <= 0:
+                break
+
+            if seg_type in ("platform", "flat"):
+                heights[:, cur_x:x_end] = cur_h
+
+            elif seg_type == "slope_up":
+                rise = seg_len_scaled * np.tan(slope_angle)
+                rise = min(rise, platform_h)
+                for ix in range(actual_samples):
+                    frac = (ix + 1) / actual_samples
+                    heights[:, cur_x + ix] = cur_h + frac * rise
+                cur_h += rise
+
+            elif seg_type == "slope_down":
+                drop = seg_len_scaled * np.tan(slope_angle)
+                drop = min(drop, cur_h)
+                for ix in range(actual_samples):
+                    frac = (ix + 1) / actual_samples
+                    heights[:, cur_x + ix] = cur_h - frac * drop
+                cur_h -= drop
+
+            elif seg_type == "stairs_up":
+                step_samples = max(1, int(round(step_w / h_scale)))
+                target_rise = min(platform_h - cur_h, platform_h)
+                target_rise = max(target_rise, 0.0)
+                n_steps = max(1, round(target_rise / step_h)) if step_h > 1e-6 else 1
+                real_rise = n_steps * step_h
+                col = cur_x
+                for s in range(n_steps):
+                    c_end = min(x_end, col + step_samples)
+                    heights[:, col:c_end] = cur_h + (s + 1) * step_h
+                    col = c_end
+                if col < x_end:
+                    heights[:, col:x_end] = cur_h + real_rise
+                cur_h += real_rise
+
+            elif seg_type == "stairs_down":
+                step_samples = max(1, int(round(step_w / h_scale)))
+                target_drop = min(cur_h, platform_h)
+                target_drop = max(target_drop, 0.0)
+                n_steps = max(1, round(target_drop / step_h)) if step_h > 1e-6 else 1
+                real_drop = n_steps * step_h
+                col = cur_x
+                for s in range(n_steps):
+                    c_end = min(x_end, col + step_samples)
+                    heights[:, col:c_end] = cur_h - (s + 1) * step_h
+                    col = c_end
+                if col < x_end:
+                    heights[:, col:x_end] = cur_h - real_drop
+                cur_h -= real_drop
+
+            elif seg_type == "rough":
+                noise_lo, noise_hi = cfg.noise_range
+                noise_step_v = cfg.noise_step
+                for ix in range(actual_samples):
+                    col_noise = rng.uniform(noise_lo, noise_hi, size=(self.ny,))
+                    if noise_step_v > 1e-6:
+                        col_noise = (np.round(col_noise / noise_step_v) * noise_step_v)
+                    heights[:, cur_x + ix] = cur_h + col_noise.astype(np.float32)
+                # rough doesn't change running height
+
+            else:
+                # Unknown segment type: treat as flat at current height.
+                heights[:, cur_x:x_end] = cur_h
+
+            cur_x = x_end
+
+        # Fill any remaining columns at final height
+        if cur_x < self.nx:
+            heights[:, cur_x:] = cur_h
+
+        # Clamp: no negative heights (MuJoCo hfield base is 0).
+        heights = np.maximum(heights, 0.0)
+        return heights.astype(np.float32)
+
     def _generate_wave(self) -> np.ndarray:
         """Generate wave terrain."""
         cfg = self.config

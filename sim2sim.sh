@@ -13,7 +13,7 @@ ONNX_PATH="${ONNX_PATH:-logs/rsl_rl/unitree_g1_rough/2026-03-01_10-21-45/export/
 DEPLOY_YAML="${DEPLOY_YAML:-}"
 
 # Teleop:
-# - "keyboard": UP/DOWN vx, LEFT/RIGHT wz, PgUp/PgDn vy, SPACE=zero
+# - "keyboard": UP/DOWN=vx, LEFT/RIGHT=wz, PgUp/PgDn=vy, Backspace=zero
 # - "off": fixed command (from task or --velocity)
 TELEOP="${TELEOP:-keyboard}"
 
