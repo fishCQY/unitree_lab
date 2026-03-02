@@ -9,11 +9,11 @@ set -euo pipefail
 
 ROBOT="${ROBOT:-g1}"
 TASK="${TASK:-rough_forward}"
-ONNX_PATH="${ONNX_PATH:-logs/rsl_rl/unitree_g1_rough/2026-02-28_22-47-22/export/policy_iter_3000.onnx}"
+ONNX_PATH="${ONNX_PATH:-logs/rsl_rl/unitree_g1_rough/2026-03-01_10-21-45/export/policy_iter_7000.onnx}"
 DEPLOY_YAML="${DEPLOY_YAML:-}"
 
 # Teleop:
-# - "keyboard": W/S vx, A/D vy, Q/E wz, SPACE=zero
+# - "keyboard": UP/DOWN vx, LEFT/RIGHT wz, PgUp/PgDn vy, SPACE=zero
 # - "off": fixed command (from task or --velocity)
 TELEOP="${TELEOP:-keyboard}"
 
@@ -23,7 +23,6 @@ cmd=(python scripts/mujoco_eval/run_sim2sim_locomotion.py
   --task "${TASK}"
   --render --deploy --follow
   --teleop "${TELEOP}"
-  --velocity 0.0 0.0 0.0
 )
 
 # Auto-pick deploy.yaml next to the ONNX if present (for correct Kp/Kd, offsets, etc.).
@@ -42,6 +41,12 @@ fi
 # Standing test: zero velocity + no teleop so robot must balance in place.
 if [[ "${STAND:-0}" == "1" ]]; then
   cmd=("${cmd[@]/--teleop keyboard/--teleop off}")
+  cmd+=(--velocity 0.0 0.0 0.0)
+  cmd=("${cmd[@]/--follow/}")
+  cmd=("${cmd[@]/--render/}")
+else
+  # Default forward velocity 1.0 m/s (keyboard teleop uses this as starting value).
+  cmd+=(--velocity 1.0 0.0 0.0)
 fi
 
 exec "${cmd[@]}" "$@"

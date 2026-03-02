@@ -77,7 +77,7 @@ class UnitreeG1RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     class_name = "AMPRunner"
     num_steps_per_env = 24
     max_iterations = 200000
-    save_interval = 1000
+    save_interval = 500
     experiment_name = "unitree_g1_rough"
     empirical_normalization = True
     obs_groups = {
@@ -161,7 +161,7 @@ class UnitreeG1RoughDepthPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     class_name = "AMPRunner"
     num_steps_per_env = 24
     max_iterations = 200000
-    save_interval = 1000
+    save_interval = 500
     experiment_name = "unitree_g1_rough_depth"
     empirical_normalization = True
     obs_groups = {

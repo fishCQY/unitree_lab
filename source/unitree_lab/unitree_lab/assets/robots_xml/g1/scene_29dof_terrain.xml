@@ -16,25 +16,10 @@
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
 
     <!--
-      Heightfield placeholder for sim2sim terrains.
-      We overwrite model.hfield_data at runtime (see scripts/mujoco_eval/run_sim2sim_locomotion.py).
-      size = sx sy sz base (MuJoCo): heights = base + sz * hfield_data, with hfield_data in [0,1].
-
-      IMPORTANT:
-      - Heightfields are finite in MuJoCo; make sx/sy large enough so the robot doesn't walk out.
-      - Keep horizontal resolution reasonable (~0.1m) so obstacles don't collapse to 1-cell artifacts.
+      Heightfield for sim2sim terrains (overwritten at runtime).
+      Sized for real-time rendering: 40m x 32m at ~0.1m resolution.
     -->
-    <!-- NOTE: MuJoCo requires all 'size' params to be positive; keep base >= 0 and fit heights in code. -->
-    <!-- MuJoCo expects all 4 size components to be strictly positive (including base). -->
-    <!-- Use an in-XML placeholder (flat) and inject the actual terrain heights at runtime. -->
-    <!--
-      Match IsaacLab rough world scale more closely:
-      - tile_size=8m, num_rows=10, num_cols=20, border_width=20m
-      => world size = (20*8 + 2*20) x (10*8 + 2*20) = 200m x 120m
-      Use ~0.1m resolution => 2001 x 1201 samples.
-    -->
-    <!-- Increase size_z so height variations are visually clearer in MuJoCo. -->
-    <hfield name="terrain_hfield" nrow="1201" ncol="2001" size="100 60 1.0 0.001"/>
+    <hfield name="terrain_hfield" nrow="321" ncol="401" size="20 16 1.0 0.001"/>
   </asset>
 
   <worldbody>

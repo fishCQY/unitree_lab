@@ -810,8 +810,11 @@ class BaseMujocoSimulator:
             "actions": [],
         }
         
+        import time as _time
+
         try:
             for step in range(max_steps):
+                t0 = _time.monotonic()
                 obs, info = self.step()
                 
                 # Store data
@@ -825,9 +828,12 @@ class BaseMujocoSimulator:
                 if self._check_termination():
                     break
                 
-                # Render
+                # Render with real-time pacing
                 if viewer is not None:
                     viewer.sync()
+                    remaining = self.policy_dt - (_time.monotonic() - t0)
+                    if remaining > 0:
+                        _time.sleep(remaining)
         finally:
             if viewer is not None:
                 viewer.close()
@@ -872,6 +878,8 @@ class BaseMujocoSimulator:
                 for _ in range(num_episodes)
             ]
 
+        import time as _time
+
         viewer = mujoco.viewer.launch_passive(self.model, self.data)
         results: list[dict] = []
         try:
@@ -889,6 +897,7 @@ class BaseMujocoSimulator:
                 }
 
                 for _step in range(max_steps_per_episode):
+                    t0 = _time.monotonic()
                     _obs, info = self.step()
 
                     episode_data["base_pos"].append(info["base_pos"])
@@ -901,6 +910,10 @@ class BaseMujocoSimulator:
 
                     if self._check_termination():
                         break
+
+                    remaining = self.policy_dt - (_time.monotonic() - t0)
+                    if remaining > 0:
+                        _time.sleep(remaining)
 
                 for key in episode_data:
                     episode_data[key] = np.array(episode_data[key])
@@ -936,25 +949,31 @@ class BaseMujocoSimulator:
         - Runs policy steps and syncs the viewer every step
         - When termination happens or max steps reached, resets and continues
         - Exits cleanly when the viewer window is closed by the user
+        - Real-time pacing keeps the viewer at the correct policy frequency
         """
+        import time as _time
+
         viewer = mujoco.viewer.launch_passive(self.model, self.data)
         try:
             while viewer.is_running():
-                # Start a new episode
                 self.reset()
                 if velocity_command:
                     self.set_velocity_command(*velocity_command)
 
                 for _step in range(max_steps_per_episode):
-                    # Viewer might get closed during episode
                     if not viewer.is_running():
                         return
 
+                    t0 = _time.monotonic()
                     self.step()
                     viewer.sync()
 
                     if self._check_termination():
                         break
+
+                    remaining = self.policy_dt - (_time.monotonic() - t0)
+                    if remaining > 0:
+                        _time.sleep(remaining)
         finally:
             viewer.close()
     

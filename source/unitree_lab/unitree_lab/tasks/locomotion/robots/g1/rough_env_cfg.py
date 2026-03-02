@@ -136,8 +136,8 @@ class G1CommandsCfg:
         heading_control_stiffness=2.0,
         debug_vis=True,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(-1.5, 1.5),
-            lin_vel_y=(-0.5, 0.5),
+            lin_vel_x=(-2.0, 2.0),
+            lin_vel_y=(-0.0, 0.0),
             ang_vel_z=(-2.0, 2.0),
             heading=(-math.pi, math.pi),
         ),
@@ -395,6 +395,6 @@ class UnitreeG1RoughEnvCfg_PLAY(UnitreeG1RoughEnvCfg):
             self.scene.terrain.terrain_generator.curriculum = False
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
-        self.commands.base_velocity.ranges.lin_vel_x = (-1.5, 1.5)
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
+        self.commands.base_velocity.ranges.lin_vel_x = (-2.0, 2.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-2.0, 2.0)

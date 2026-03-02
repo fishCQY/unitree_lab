@@ -267,6 +267,7 @@ def _build_overlay_text(
     teleop: KeyboardTeleop | None,
     simulator: Any,
     step: int,
+    fps: float = 0.0,
 ) -> list[tuple]:
     """Build text overlay tuples for viewer.set_texts."""
     import mujoco
@@ -289,13 +290,13 @@ def _build_overlay_text(
         cmd_right,
     ))
 
-    # Step counter + base height (bottom-right)
+    # Step counter + base height + FPS (bottom-right)
     z = simulator.base_pos[2]
     texts.append((
         mujoco.mjtFontScale.mjFONTSCALE_150,
         mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT,
-        f"Step\nHeight",
-        f"{step}\n{z:.3f} m",
+        f"Step\nHeight\nFPS",
+        f"{step}\n{z:.3f} m\n{int(fps)}",
     ))
 
     return texts
@@ -309,7 +310,13 @@ def run_interactive(
     velocity: tuple[float, float, float] | None = None,
     max_steps_per_episode: int = 1000,
 ) -> None:
-    """Run interactive sim2sim with MuJoCo viewer."""
+    """Run interactive sim2sim with MuJoCo viewer.
+
+    Real-time pacing: each policy step targets ``simulator.policy_dt`` of
+    wall-clock time so the viewer runs at the correct real-time speed
+    (typically 50 Hz for policy_dt=0.02 s).  If the physics computation
+    takes longer than policy_dt the viewer will still remain responsive.
+    """
     import mujoco
     import mujoco.viewer
 
@@ -331,6 +338,15 @@ def run_interactive(
         simulator.model, simulator.data, key_callback=key_callback,
     )
 
+    policy_dt = getattr(simulator, "policy_dt", 0.02)
+    target_fps = int(round(1.0 / policy_dt)) if policy_dt > 0 else 50
+    print(f"[Sim2Sim] Interactive mode: target FPS = {target_fps} (policy_dt={policy_dt:.4f}s)")
+
+    _fps_window: list[float] = []
+    _FPS_WINDOW_SIZE = 50
+    _fps_display = 0
+    _fps_print_interval = 100
+
     try:
         while viewer.is_running():
             simulator.reset()
@@ -340,6 +356,9 @@ def run_interactive(
                 simulator.set_velocity_command(*velocity)
             elif hasattr(task, "velocity_command"):
                 simulator.set_velocity_command(*task.velocity_command)
+
+            _prev_time = time.monotonic()
+            _fps_window.clear()
 
             for _step in range(max_steps_per_episode):
                 if not viewer.is_running():
@@ -356,14 +375,34 @@ def run_interactive(
                     _update_camera_follow(viewer, simulator)
 
                 viewer.set_texts(
-                    _build_overlay_text(teleop_ctrl, simulator, _step + 1)
+                    _build_overlay_text(teleop_ctrl, simulator, _step + 1, fps=_fps_display)
                 )
                 viewer.sync()
 
                 if simulator._check_termination():
-                    print(f"[Sim2Sim] Terminated at step {_step + 1}, resetting...")
+                    print(f"[Sim2Sim] Terminated at step {_step + 1}, FPS: {_fps_display}, resetting...")
                     time.sleep(0.3)
                     break
+
+                # Real-time pacing: sleep remainder of policy_dt budget
+                now = time.monotonic()
+                compute_elapsed = now - _prev_time
+                remaining = policy_dt - compute_elapsed
+                if remaining > 0:
+                    time.sleep(remaining)
+
+                # Measure true frame-to-frame interval (includes sleep)
+                now = time.monotonic()
+                frame_dt = now - _prev_time
+                _prev_time = now
+
+                _fps_window.append(frame_dt)
+                if len(_fps_window) > _FPS_WINDOW_SIZE:
+                    _fps_window.pop(0)
+                _fps_display = int(round(len(_fps_window) / sum(_fps_window)))
+
+                if _step > 0 and _step % _fps_print_interval == 0:
+                    print(f"[Sim2Sim] Step {_step:5d}  FPS: {_fps_display} (target: {target_fps})")
     finally:
         viewer.close()
 
@@ -519,6 +558,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--velocity", type=float, nargs=3, default=None,
                         metavar=("VX", "VY", "WZ"),
                         help="Fixed velocity command [vx, vy, wz]")
+    parser.add_argument("--skip-terrain-inject", action="store_true",
+                        help="Do NOT overwrite heightfield data at runtime; use XML terrain as-is")
 
     # Deploy config
     parser.add_argument("--deploy-yaml", type=str, default=None,
@@ -608,7 +649,7 @@ def main() -> None:
             print(f"[Warning] Failed to parse --config-override: {e}")
 
     # Create simulator
-    from unitree_lab.mujoco_utils import BaseMujocoSimulator
+    from unitree_lab.mujoco_utils.simulation.base_simulator import BaseMujocoSimulator
 
     simulator = BaseMujocoSimulator(
         xml_path=str(xml_path),
@@ -616,8 +657,8 @@ def main() -> None:
         config_override=config_override if config_override else None,
     )
 
-    # Setup terrain if needed
-    if uses_terrain:
+    # Setup terrain if needed (unless user wants to use XML terrain as-is)
+    if uses_terrain and (not bool(args.skip_terrain_inject)):
         spawn_z = _setup_terrain(simulator, task)
         if spawn_z > 0:
             simulator.spawn_root_z_offset = spawn_z

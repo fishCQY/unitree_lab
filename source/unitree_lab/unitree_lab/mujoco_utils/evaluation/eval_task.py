@@ -107,17 +107,14 @@ LOCOMOTION_EVAL_TASKS = {
     "rough_forward": LocomotionEvalTask(
         name="rough_forward",
         description="Walk forward on rough terrain",
-        # Align with IsaacLab "rough" semantics: use the SAME sub-terrain palette + proportions
-        # as unitree_lab/terrain/rough.py -> HumanoidRoughTerrainsCfg (grid layout).
         terrain_type="mixed",
         terrain_config={
             "difficulty": 0.6,
-            # IsaacLab-like world layout (tiles + border)
             "mixed_layout": "grid",
             "mixed_tile_size": 8.0,
-            "mixed_num_rows": 10,
-            "mixed_num_cols": 20,
-            "mixed_border_width": 20.0,
+            "mixed_num_rows": 3,
+            "mixed_num_cols": 4,
+            "mixed_border_width": 4.0,
             "mixed_types": (
                 "flat",
                 "stepping_stones",
@@ -127,14 +124,10 @@ LOCOMOTION_EVAL_TASKS = {
                 "rails",
                 "washboard",
             ),
-            # EXACT match to IsaacLab HumanoidRoughTerrainsCfg (no stairs)
             "mixed_proportions": (0.15, 0.20, 0.15, 0.15, 0.15, 0.10, 0.10),
-            # Guarantee the robot starts on a flat patch at the origin.
             "mixed_spawn_flat": True,
             "mixed_spawn_flat_halfwidth": 1.2,
-            # Keep deterministic-by-default so "rough_forward" is comparable run-to-run.
             "seed": 0,
-            # Best-effort param alignment with IsaacLab ranges (used by heightfield approximations)
             "stone_width_range": (0.4, 0.2),
             "stone_height_range": (0.05, 0.12),
             "gap_width_range": (0.1, 0.2),
@@ -194,12 +187,11 @@ LOCOMOTION_EVAL_TASKS = {
         terrain_type="mixed",
         terrain_config={
             "difficulty": 0.6,
-            # IMPORTANT: Use IsaacLab-like grid layout (tiles + border) so it looks like IsaacLab rough.
             "mixed_layout": "grid",
             "mixed_tile_size": 8.0,
-            "mixed_num_rows": 10,
-            "mixed_num_cols": 20,
-            "mixed_border_width": 20.0,
+            "mixed_num_rows": 3,
+            "mixed_num_cols": 4,
+            "mixed_border_width": 4.0,
             "mixed_types": (
                 "flat",
                 "stepping_stones",
@@ -208,24 +200,16 @@ LOCOMOTION_EVAL_TASKS = {
                 "pyramid",
                 "rails",
                 "washboard",
-                # Stairs (IsaacLab HumanoidRoughTerrainsWithStairsCfg)
                 "pyramid_stairs",
                 "pyramid_stairs_inv",
             ),
-            # EXACT match to IsaacLab HumanoidRoughTerrainsCfg (keys + proportions):
-            # unitree_lab/terrain/rough.py -> HumanoidRoughTerrainsCfg.sub_terrains
-            # If you want stairs included, match HumanoidRoughTerrainsWithStairsCfg instead:
-            # flat=0.10, stepping_stones=0.15, wave=0.15, cambered=0.15, pyramid=0.15,
-            # rails=0.10, washboard=0.10, stairs_up=0.05, stairs_down=0.05
             "mixed_proportions": (0.10, 0.15, 0.15, 0.15, 0.15, 0.10, 0.10, 0.05, 0.05),
             "mixed_spawn_flat": True,
             "mixed_spawn_flat_halfwidth": 1.2,
             "seed": 1,
-            # Match IsaacLab parameter ranges as closely as the heightfield implementation allows.
             "stone_width_range": (0.4, 0.2),
             "stone_height_range": (0.05, 0.12),
             "gap_width_range": (0.1, 0.2),
-            # IsaacLab wave uses wavelength ~1.5m (=> frequency ~0.6667 cycles/m)
             "wave_amplitude": 0.06,
             "wave_frequency": 1.0 / 1.5,
             "cross_slope_range_deg": (5.0, 15.0),
@@ -236,7 +220,6 @@ LOCOMOTION_EVAL_TASKS = {
             "washboard_direction": "diagonal",
             "ridge_height_range": (0.01, 0.03),
             "ridge_spacing_range": (0.15, 0.05),
-            # Stairs parameters (approximate IsaacLab ranges)
             "step_height": 0.12,
             "step_width": 0.25,
         },
