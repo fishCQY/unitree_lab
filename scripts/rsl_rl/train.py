@@ -39,7 +39,7 @@ parser.add_argument(
     "--sim2sim", action="store_true", default=False,
     help="Run MuJoCo sim2sim eval on each checkpoint save and upload video to W&B (requires --logger wandb).",
 )
-parser.add_argument("--sim2sim_duration", type=float, default=5.0, help="Sim2sim episode duration in seconds.")
+parser.add_argument("--sim2sim_duration", type=float, default=10.0, help="Sim2sim episode duration in seconds.")
 parser.add_argument("--sim2sim_robot", type=str, default="g1", help="MuJoCo robot name for sim2sim.")
 parser.add_argument(
     "--sim2sim_xml", type=str, default=None,
@@ -488,6 +488,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "--output-dir", str(out_dir),
             "--save-video",
             "--video-steps", str(max_steps),
+            "--velocity", "1.0", "0.0", "0.0",
         ]
         if os.path.isfile(deploy_yaml_path):
             cmd += ["--deploy-yaml", deploy_yaml_path]

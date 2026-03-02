@@ -737,6 +737,7 @@ def run_headless(
     save_video: bool = False,
     output_dir: str = "eval_results",
     video_steps: int = 500,
+    velocity: tuple[float, float, float] | None = None,
 ) -> dict[str, Any]:
     """Run headless evaluation episodes."""
     from unitree_lab.mujoco_utils.evaluation.batch_evaluator import BatchEvaluator
@@ -745,7 +746,7 @@ def run_headless(
         print_metrics,
     )
 
-    vel_cmd = getattr(task, "velocity_command", (0.5, 0.0, 0.0))
+    vel_cmd = velocity if velocity is not None else getattr(task, "velocity_command", (0.5, 0.0, 0.0))
     episode_results = []
 
     for ep_idx in range(num_episodes):
@@ -773,7 +774,7 @@ def run_headless(
     }
 
     if save_video:
-        video_path = _record_video_headless(simulator, task, output_dir, video_steps)
+        video_path = _record_video_headless(simulator, task, output_dir, video_steps, velocity=velocity)
         if video_path:
             summary["video"] = video_path
 
@@ -883,6 +884,7 @@ def _record_video_headless(
     task: Any,
     output_dir: str,
     duration_steps: int = 500,
+    velocity: tuple[float, float, float] | None = None,
 ) -> str | None:
     """Record an evaluation video without a viewer window.
 
@@ -921,7 +923,7 @@ def _record_video_headless(
     cam.lookat[:] = [0, 0, 0.8]
 
     simulator.reset()
-    vel_cmd = getattr(task, "velocity_command", (0.5, 0.0, 0.0))
+    vel_cmd = velocity if velocity is not None else getattr(task, "velocity_command", (0.5, 0.0, 0.0))
     simulator.set_velocity_command(*vel_cmd)
 
     frames: list[np.ndarray] = []
@@ -1141,6 +1143,7 @@ def main() -> None:
             save_video=args.save_video,
             output_dir=args.output_dir,
             video_steps=args.video_steps,
+            velocity=velocity,
         )
         print(f"\nTask: {summary['task']}")
         print(f"  Episodes:         {summary['num_episodes']}")
