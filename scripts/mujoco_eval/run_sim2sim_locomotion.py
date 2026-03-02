@@ -309,7 +309,7 @@ def _generate_course_xml(xml_path: Path, task: Any) -> tuple[Path, float]:
             cur_x += seg_len
 
         elif seg_type == "rough":
-            # Rough ground: small random boxes on the ground plane.
+            # 碎石地: discrete stone-like bumps (larger, sparser).
             rng = np.random.default_rng(42 + geom_idx)
             n_bumps = int(seg_len * half_y * 2 * 2)  # ~2 bumps per m²
             for _ in range(n_bumps):
@@ -328,6 +328,55 @@ def _generate_course_xml(xml_path: Path, task: Any) -> tuple[Path, float]:
                 bump.set("conaffinity", "1")
                 bump.set("rgba", "0.3 0.4 0.5 1")
                 geom_idx += 1
+            cur_x += seg_len
+
+        elif seg_type == "rough_ground":
+            # Continuous heightfield with gentle undulations.
+            # Use coarser grid + extra smoothing to avoid foot-snagging artifacts.
+            rng = np.random.default_rng(43 + geom_idx)
+            res = 0.10  # 10cm grid (coarser = fewer sharp edges for contacts)
+            ncol = max(2, int(seg_len / res))
+            nrow = max(2, int((2 * half_y) / res))
+            h_raw = rng.uniform(-1.0, 1.0, (nrow, ncol))
+            # Two passes of 3x3 box filter for a smoother surface
+            h_smooth = h_raw.astype(np.float64)
+            for _ in range(2):
+                h_pad = np.pad(h_smooth, 1, mode="edge")
+                h_smooth = (
+                    h_pad[0:-2, 0:-2] + h_pad[0:-2, 1:-1] + h_pad[0:-2, 2:]
+                    + h_pad[1:-1, 0:-2] + h_pad[1:-1, 1:-1] + h_pad[1:-1, 2:]
+                    + h_pad[2:, 0:-2] + h_pad[2:, 1:-1] + h_pad[2:, 2:]
+                ) / 9.0
+            amp = max(0.002, min(0.005, noise_amp * 0.4)) if noise_amp > 0 else 0.003
+            h_min, h_max = h_smooth.min(), h_smooth.max()
+            heights_phys = amp * (h_smooth - h_min) / (h_max - h_min + 1e-8)
+            elev_range = float(np.ptp(heights_phys))
+            elev_range = max(elev_range, 0.001)
+            hf_base_thickness = 0.05
+            heights_norm = (heights_phys / elev_range).astype(np.float32)
+            hf_name = f"rough_ground_{geom_idx}"
+            hf_file = xml_dir / f"{hf_name}.bin"
+            with open(hf_file, "wb") as f:
+                f.write(np.array([nrow, ncol], dtype=np.int32).tobytes())
+                f.write(heights_norm.flatten(order="C").tobytes())
+            half_x, half_y_hf = seg_len / 2.0, half_y
+            hf_el = ET.SubElement(asset_el, "hfield")
+            hf_el.set("name", hf_name)
+            hf_el.set("nrow", str(nrow))
+            hf_el.set("ncol", str(ncol))
+            hf_el.set("size", f"{half_x} {half_y_hf} {elev_range} {hf_base_thickness}")
+            hf_el.set("file", str(hf_file.resolve()))
+            geom_hf = ET.SubElement(wb, "geom")
+            geom_hf.set("name", f"course_{geom_idx}")
+            geom_hf.set("type", "hfield")
+            geom_hf.set("hfield", hf_name)
+            hf_z = cur_h - hf_base_thickness
+            geom_hf.set("pos", f"{cur_x + seg_len / 2} 0 {hf_z}")
+            geom_hf.set("friction", "0.8 0.005 0.0001")
+            geom_hf.set("contype", "1")
+            geom_hf.set("conaffinity", "1")
+            geom_hf.set("material", "groundplane")
+            geom_idx += 1
             cur_x += seg_len
 
         else:
@@ -534,8 +583,11 @@ def run_interactive(
     teleop: str = "off",
     follow: bool = False,
     velocity: tuple[float, float, float] | None = None,
-    max_steps_per_episode: int = 1000,
+    max_steps_per_episode: int | None = None,
     initial_spawn_z: float = 0.0,
+    save_video: bool = False,
+    output_dir: str = "eval_results",
+    video_steps: int = 500,
 ) -> None:
     """Run interactive sim2sim with MuJoCo viewer.
 
@@ -543,6 +595,13 @@ def run_interactive(
     wall-clock time so the viewer runs at the correct real-time speed
     (typically 50 Hz for policy_dt=0.02 s).  If the physics computation
     takes longer than policy_dt the viewer will still remain responsive.
+
+    By default (max_steps_per_episode is None) the simulation runs until the robot
+    terminates (e.g. falls) or you close the viewer; no time-based reset. Pass a
+    positive int to force a reset after that many steps.
+
+    If save_video is True, the session is recorded to output_dir from start until
+    the viewer is closed, using the same tracking camera as headless mode.
     """
     import mujoco
     import mujoco.viewer
@@ -574,6 +633,9 @@ def run_interactive(
     _fps_display = 0
     _fps_print_interval = 100
 
+    # Optional video recording from start until viewer is closed (same tracking camera as headless)
+    _video_frames: list[np.ndarray] = []
+
     try:
         while viewer.is_running():
             if teleop_ctrl is not None:
@@ -588,10 +650,11 @@ def run_interactive(
 
             _prev_time = time.monotonic()
             _fps_window.clear()
+            _step = 0
 
-            for _step in range(max_steps_per_episode):
+            while True:
                 if not viewer.is_running():
-                    return
+                    break
 
                 if teleop_ctrl is not None and teleop_ctrl._dirty:
                     simulator.set_velocity_command(*teleop_ctrl.command)
@@ -599,6 +662,10 @@ def run_interactive(
                     teleop_ctrl.flush_msg()
 
                 simulator.step()
+
+                # Capture frame for video (no duration limit; write when viewer closes)
+                if save_video:
+                    _video_frames.append(_render_one_frame_tracking(simulator))
 
                 if follow:
                     _update_camera_follow(viewer, simulator)
@@ -611,6 +678,11 @@ def run_interactive(
                 if simulator._check_termination():
                     print(f"[Sim2Sim] Terminated at step {_step + 1}, FPS: {_fps_display}, resetting...")
                     time.sleep(0.3)
+                    break
+
+                # Optional: reset after a fixed number of steps (when max_steps_per_episode is set)
+                if max_steps_per_episode is not None and max_steps_per_episode > 0 and _step + 1 >= max_steps_per_episode:
+                    print(f"[Sim2Sim] Reached {max_steps_per_episode} steps, resetting...")
                     break
 
                 # Real-time pacing: sleep remainder of policy_dt budget
@@ -632,8 +704,20 @@ def run_interactive(
 
                 if _step > 0 and _step % _fps_print_interval == 0:
                     print(f"[Sim2Sim] Step {_step:5d}  FPS: {_fps_display} (target: {target_fps})")
+
+                _step += 1
+    except KeyboardInterrupt:
+        print("\n[Sim2Sim] Interrupted by user.")
     finally:
-        viewer.close()
+        try:
+            viewer.close()
+        except Exception:
+            pass
+        if save_video and _video_frames:
+            print(f"[Sim2Sim] Writing {len(_video_frames)} frames to video...")
+            _write_frames_to_video(
+                _video_frames, task, output_dir, simulator.policy_dt,
+            )
 
 
 def _update_camera_follow(viewer: Any, simulator: Any) -> None:
@@ -694,6 +778,104 @@ def run_headless(
             summary["video"] = video_path
 
     return summary
+
+
+def _render_one_frame_tracking(simulator: Any) -> np.ndarray:
+    """Render one frame with the same tracking camera as headless video (for interactive recording)."""
+    import mujoco
+    width, height = 1280, 720
+    if getattr(simulator, "_video_renderer", None) is None:
+        # Ensure offscreen framebuffer is large enough (model XML may use smaller default).
+        if simulator.model.vis.global_.offwidth < width:
+            simulator.model.vis.global_.offwidth = width
+        if simulator.model.vis.global_.offheight < height:
+            simulator.model.vis.global_.offheight = height
+        r = mujoco.Renderer(simulator.model, height, width)
+        simulator._video_renderer = r
+        cam = mujoco.MjvCamera()
+        cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        base_body_id = getattr(simulator, "_base_body_id", None)
+        cam.trackbodyid = base_body_id if (base_body_id is not None and base_body_id > 0) else 1
+        cam.distance = 3.0
+        cam.azimuth = -150
+        cam.elevation = -20
+        cam.lookat[:] = [0, 0, 0.8]
+        simulator._video_cam = cam
+    simulator._video_renderer.update_scene(simulator.data, camera=simulator._video_cam)
+    return simulator._video_renderer.render()
+
+
+def _write_frames_to_video(
+    frames: list[np.ndarray],
+    task: Any,
+    output_dir: str,
+    policy_dt: float,
+) -> None:
+    """Write captured frames to a playable H.264 MP4.
+
+    Pipe raw RGB frames to ffmpeg via stdin — no intermediate file, no codec
+    compatibility issues, and works everywhere ffmpeg is installed.
+    Falls back to imageio, then cv2+ffmpeg transcode.
+    """
+    if not frames:
+        return
+    import subprocess
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    video_file = out_path / f"{task.name}_sim2sim.mp4"
+    fps = int(1.0 / policy_dt) if policy_dt > 0 else 50
+    height, width = frames[0].shape[:2]
+
+    # Method 1: pipe raw frames to ffmpeg (best: no temp file, direct H.264)
+    try:
+        proc = subprocess.Popen(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}", "-r", str(fps),
+                "-i", "pipe:0",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", "-preset", "veryfast", "-crf", "23",
+                str(video_file),
+            ],
+            stdin=subprocess.PIPE,
+        )
+        for frame in frames:
+            proc.stdin.write(frame.tobytes())
+        proc.stdin.close()
+        proc.wait()
+        if proc.returncode == 0:
+            print(f"[Sim2Sim] Video saved ({len(frames)} frames): {video_file}")
+            return
+        print(f"[Warning] ffmpeg pipe exited with code {proc.returncode}")
+    except FileNotFoundError:
+        print("[Warning] ffmpeg not found, trying imageio fallback")
+    except Exception as e:
+        print(f"[Warning] ffmpeg pipe failed: {e}")
+
+    # Method 2: imageio
+    try:
+        import imageio
+        writer = imageio.get_writer(str(video_file), fps=fps, codec="libx264", quality=8)
+        for frame in frames:
+            writer.append_data(frame)
+        writer.close()
+        print(f"[Sim2Sim] Video saved ({len(frames)} frames): {video_file}")
+        return
+    except Exception as e:
+        print(f"[Warning] imageio failed: {e}")
+
+    # Method 3: cv2 mp4v (may not open in all players)
+    try:
+        import cv2
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(video_file), fourcc, fps, (width, height))
+        for frame in frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        writer.release()
+        print(f"[Sim2Sim] Video saved (mp4v fallback, {len(frames)} frames): {video_file}")
+    except Exception as e:
+        print(f"[Warning] All video writers failed: {e}")
 
 
 def _record_video_headless(
@@ -933,9 +1115,11 @@ def main() -> None:
 
     # Run
     if args.render or args.deploy:
-        max_steps = task.max_episode_steps
-        if args.deploy:
-            max_steps = max(max_steps, 2000)
+        # Interactive: no step-based reset; only reset on termination or viewer close.
+        # Pass max_steps_per_episode=None. Use --max-steps to force a step limit if needed.
+        max_steps = getattr(args, "max_steps", None)
+        if max_steps is not None:
+            max_steps = int(max_steps)
 
         run_interactive(
             simulator=simulator,
@@ -945,6 +1129,9 @@ def main() -> None:
             velocity=velocity,
             max_steps_per_episode=max_steps,
             initial_spawn_z=getattr(simulator, "spawn_root_z_offset", 0.0),
+            save_video=args.save_video,
+            output_dir=args.output_dir,
+            video_steps=args.video_steps,
         )
     else:
         summary = run_headless(
@@ -963,10 +1150,13 @@ def main() -> None:
         if "video" in summary:
             print(f"  Video:            {summary['video']}")
 
-    # Clean up temporary XML.
+    # Clean up temporary XML and heightfield bin files.
     if _tmp_xml is not None:
         try:
+            xml_dir = _tmp_xml.parent
             _tmp_xml.unlink(missing_ok=True)
+            for f in xml_dir.glob("rough_ground_*.bin"):
+                f.unlink(missing_ok=True)
         except Exception:
             pass
 

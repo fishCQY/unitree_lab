@@ -6,11 +6,15 @@ set -euo pipefail
 # Stand/debug mode:
 #   STAND=1 bash sim2sim.sh
 # This forces command velocity to (0,0,0) for checking whether the robot can stand still.
+#
+# Video: --save-video records from start until you close the viewer; saved to OUTPUT_DIR
+#        as <task>_sim2sim.mp4 (e.g. rough_forward_sim2sim.mp4).
 
 ROBOT="${ROBOT:-g1}"
 TASK="${TASK:-rough_forward}"
 ONNX_PATH="${ONNX_PATH:-logs/rsl_rl/unitree_g1_rough/2026-03-01_10-21-45/export/policy_iter_7000.onnx}"
 DEPLOY_YAML="${DEPLOY_YAML:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-eval_results}"
 
 # Teleop:
 # - "keyboard": UP/DOWN=vx, LEFT/RIGHT=wz, PgUp/PgDn=vy, Backspace=zero
@@ -23,6 +27,8 @@ cmd=(python scripts/mujoco_eval/run_sim2sim_locomotion.py
   --task "${TASK}"
   --render --deploy --follow
   --teleop "${TELEOP}"
+  --save-video
+  --output-dir "${OUTPUT_DIR}"
 )
 
 # Auto-pick deploy.yaml next to the ONNX if present (for correct Kp/Kd, offsets, etc.).
