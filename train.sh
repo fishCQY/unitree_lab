@@ -7,7 +7,7 @@
 python scripts/rsl_rl/train.py \
   --task unitree_lab-Isaac-Velocity-Rough-Unitree-G1-AMP-v0 \
   --headless --logger wandb --log_project_name unitree_g1 \
-  --sim2sim --sim2sim_duration 5.0
+  --sim2sim --sim2sim_duration 20.0
 
 # 每 2 次 checkpoint 才跑一次 sim2sim（节省资源）
 # python scripts/rsl_rl/train.py \

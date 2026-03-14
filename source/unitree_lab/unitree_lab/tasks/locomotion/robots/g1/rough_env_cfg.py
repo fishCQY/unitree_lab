@@ -35,9 +35,14 @@ from unitree_lab.terrain import ROUGH_TERRAINS_CFG
 from unitree_lab.sensors.ray_caster import NoiseRayCasterCameraCfg
 from unitree_lab.sensors.imu import DelayedImuCfg
 
-_AMP_MOTION_DIR = str(
-    Path(__file__).resolve().parents[4] / "data" / "MotionData" / "g1_29dof" / "amp" / "walk_and_run"
-)
+# AMP demonstration motions:
+# Use walk_and_run subset for discriminator demos.
+_AMP_ROOT_DIR = Path(__file__).resolve().parents[4] / "data" / "MotionData" / "g1_29dof" / "amp"
+_AMP_WALK_RUN_DIR = _AMP_ROOT_DIR / "walk_and_run"
+
+_AMP_MOTION_FILES = []
+if _AMP_WALK_RUN_DIR.exists():
+    _AMP_MOTION_FILES = sorted(_AMP_WALK_RUN_DIR.glob("*.pkl"))
 
 
 # =============================================================================
@@ -136,9 +141,9 @@ class G1CommandsCfg:
         heading_control_stiffness=2.0,
         debug_vis=True,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(-2.0, 2.0),
-            lin_vel_y=(-0.0, 0.0),
-            ang_vel_z=(-2.0, 2.0),
+            lin_vel_x=(-1.0, 1.0),
+            lin_vel_y=(-0.5, 0.5),
+            ang_vel_z=(-1.0, 1.0),
             heading=(-math.pi, math.pi),
         ),
     )
@@ -246,38 +251,7 @@ class G1ObservationsCfg:
             func=mdp.AMPDemoObsTerm,
             params={
                 "disc_obs_steps": 2,
-                "motion_files": [
-                    _AMP_MOTION_DIR + "/B4_-_Stand_to_Walk_backwards_stageii.pkl",
-                    _AMP_MOTION_DIR + "/B9_-__Walk_turn_left_90_stageii.pkl",
-                    _AMP_MOTION_DIR + "/B10_-__Walk_turn_left_45_stageii.pkl",
-                    _AMP_MOTION_DIR + "/B11_-__Walk_turn_left_135_stageii.pkl",
-                    _AMP_MOTION_DIR + "/B13_-__Walk_turn_right_90_stageii.pkl",
-                    _AMP_MOTION_DIR + "/B14_-__Walk_turn_right_45_t2_stageii.pkl",
-                    _AMP_MOTION_DIR + "/B15_-__Walk_turn_around_stageii.pkl",
-                    _AMP_MOTION_DIR + "/B22_-__side_step_left_stageii.pkl",
-                    _AMP_MOTION_DIR + "/B23_-__side_step_right_stageii.pkl",
-                    _AMP_MOTION_DIR + "/Walk_B4_-_Stand_to_Walk_Back_stageii.pkl",
-                    _AMP_MOTION_DIR + "/Walk_B10_-_Walk_turn_left_45_stageii.pkl",
-                    _AMP_MOTION_DIR + "/Walk_B13_-_Walk_turn_right_45_stageii.pkl",
-                    _AMP_MOTION_DIR + "/Walk_B15_-_Walk_turn_around_stageii.pkl",
-                    _AMP_MOTION_DIR + "/Walk_B16_-_Walk_turn_change_stageii.pkl",
-                    _AMP_MOTION_DIR + "/Walk_B22_-_Side_step_left_stageii.pkl",
-                    _AMP_MOTION_DIR + "/Walk_B23_-_Side_step_right_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C1_-_stand_to_run_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C3_-_run_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C4_-_run_to_walk_a_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C5_-_walk_to_run_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C6_-_stand_to_run_backwards_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C8_-_run_backwards_to_stand_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C9_-_run_backwards_turn_run_forward_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C11_-_run_turn_left_90_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C12_-_run_turn_left_45_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C13_-_run_turn_left_135_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C14_-_run_turn_right_90_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C15_-_run_turn_right_45_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C16_-_run_turn_right_135_stageii.pkl",
-                    _AMP_MOTION_DIR + "/C17_-_run_change_direction_stageii.pkl",
-                ],
+                "motion_files": [str(p) for p in _AMP_MOTION_FILES],
             },
         )
 
@@ -341,6 +315,13 @@ class G1TerminationsCfg:
 @configclass
 class G1CurriculumCfg:
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
+    command_levels = CurrTerm(
+        func=mdp.command_levels_vel,
+        params={
+            "delta": [0.1, 0.05, 0.3],
+            "max_curriculum": [(-2.0, 2.0), (-0.5, 0.5), (-2.0, 2.0)],
+        },
+    )
 
 
 # =============================================================================
@@ -396,5 +377,5 @@ class UnitreeG1RoughEnvCfg_PLAY(UnitreeG1RoughEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.commands.base_velocity.ranges.lin_vel_x = (-2.0, 2.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-2.0, 2.0)

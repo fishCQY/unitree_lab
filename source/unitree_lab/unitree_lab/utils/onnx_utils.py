@@ -199,30 +199,42 @@ def build_action_spec(env) -> dict:
     }
 
 
-def build_physics_spec(env) -> dict:
+def build_physics_spec(env, action_joint_indices: list[int] | None = None) -> dict:
     """Build physics specification from environment.
     
     Args:
         env: IsaacLab ManagerBasedRLEnv
+        action_joint_indices: Optional joint indices to reorder physics params to match
+            action joint order. If None, returns params in asset (USD) order.
         
     Returns:
         Dictionary with physics parameters
     """
     asset = env.scene["robot"]
     
-    # Get PD gains
-    stiffness = asset.data.default_joint_stiffness[0].detach().cpu().numpy().tolist()
-    damping = asset.data.default_joint_damping[0].detach().cpu().numpy().tolist()
+    # Get raw data in USD/asset order
+    stiffness_raw = asset.data.default_joint_stiffness[0].detach().cpu().numpy()
+    damping_raw = asset.data.default_joint_damping[0].detach().cpu().numpy()
+    default_pos_raw = asset.data.default_joint_pos[0].detach().cpu().numpy()
+    armature_raw = asset.data.default_joint_armature[0].detach().cpu().numpy()
     
-    # Get default positions
-    default_joint_pos = asset.data.default_joint_pos[0].detach().cpu().numpy().tolist()
+    # Reorder to action joint order if indices provided
+    if action_joint_indices is not None:
+        idx = action_joint_indices
+        stiffness = stiffness_raw[idx].tolist()
+        damping = damping_raw[idx].tolist()
+        default_joint_pos = default_pos_raw[idx].tolist()
+        armature = armature_raw[idx].tolist()
+    else:
+        stiffness = stiffness_raw.tolist()
+        damping = damping_raw.tolist()
+        default_joint_pos = default_pos_raw.tolist()
+        armature = armature_raw.tolist()
     
     # Timing
     sim_dt = env.cfg.sim.dt
     decimation = env.cfg.decimation
     policy_dt = sim_dt * decimation
-    
-    armature = asset.data.default_joint_armature[0].detach().cpu().numpy().tolist()
 
     return {
         "joint_stiffness": stiffness,
@@ -250,12 +262,37 @@ def build_onnx_metadata(env) -> dict:
     obs_spec = build_obs_spec(env)
     metadata.update(obs_spec)
     
-    # Action spec
+    # Action spec (get joint names and their indices in asset order)
     action_spec = build_action_spec(env)
     metadata.update(action_spec)
     
-    # Physics spec
-    physics_spec = build_physics_spec(env)
+    # Build mapping from action joint names to asset joint indices
+    # This ensures physics params (stiffness, damping, default_pos) are in
+    # the same order as action outputs, which sim2sim expects.
+    action_joint_indices = None
+    if action_spec.get("joint_names"):
+        asset = env.scene["robot"]
+        asset_joint_names = asset.joint_names  # USD/asset order
+        action_joint_names = action_spec["joint_names"]
+        try:
+            action_joint_indices = [asset_joint_names.index(name) for name in action_joint_names]
+        except ValueError:
+            # Fallback: try without _joint suffix matching
+            action_joint_indices = []
+            for aname in action_joint_names:
+                found = False
+                for i, uname in enumerate(asset_joint_names):
+                    if aname == uname or aname.replace("_joint", "") == uname.replace("_joint", ""):
+                        action_joint_indices.append(i)
+                        found = True
+                        break
+                if not found:
+                    print(f"[Warning] Could not find joint index for: {aname}")
+                    action_joint_indices = None
+                    break
+    
+    # Physics spec (reordered to match action joint order)
+    physics_spec = build_physics_spec(env, action_joint_indices)
     metadata.update(physics_spec)
     
     # Height scan config (if available)

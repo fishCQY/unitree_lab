@@ -204,6 +204,26 @@ def command_levels_vel(
     failed_mask = torch.isin(env_ids, env.vel_update_ids[env.vel_ids_terrain_failed_mask])
     failed_env_ids = env_ids[failed_mask]
 
+    # Fallback: if no terrain-driven updates are available, still progress command curriculum
+    # from velocity tracking performance so speed curriculum doesn't stall at initial ranges.
+    if passed_env_ids.numel() == 0 and failed_env_ids.numel() == 0:
+        reward: RewardManager = env.reward_manager
+        lin_track_reward_sum = (
+            reward._episode_sums["track_lin_vel_xy_exp"][env_ids] / env.max_episode_length_s
+        )
+        lin_track_reward_idx = reward._term_names.index("track_lin_vel_xy_exp")
+        lin_track_reward_weight = reward._term_cfgs[lin_track_reward_idx].weight
+        ang_track_reward_sum = (
+            reward._episode_sums["track_ang_vel_z_exp"][env_ids] / env.max_episode_length_s
+        )
+        ang_track_reward_idx = reward._term_names.index("track_ang_vel_z_exp")
+        ang_track_reward_weight = reward._term_cfgs[ang_track_reward_idx].weight
+
+        passed_env_ids = env_ids[
+            (lin_track_reward_sum > lin_track_reward_weight * 0.8)
+            & (ang_track_reward_sum > ang_track_reward_weight * 0.7)
+        ]
+
     if passed_env_ids.numel() > 0:
         # Update the linear velocity ranges for the environments that performed well
         vel_cmd.lin_vel_x_ranges[passed_env_ids] = torch.clamp(

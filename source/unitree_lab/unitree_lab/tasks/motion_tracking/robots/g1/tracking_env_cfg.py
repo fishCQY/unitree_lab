@@ -63,8 +63,28 @@ class G1TrackingCommandsCfg(BaseTrackingCommandsCfg):
 class G1TrackingObservationsCfg:
 
     @configclass
-    class PolicyCfg(ObsGroup):
+    class CommandCfg(ObsGroup):
         motion_tracking_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion_tracking"})
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class FutureCurrentNextCommandCfg(ObsGroup):
+        """Future/current/next command set for FSQ/RFSQ interpolation."""
+
+        future_commands = ObsTerm(func=mdp.future_command, params={"command_name": "motion_tracking"})
+        current_command = ObsTerm(func=mdp.current_command, params={"command_name": "motion_tracking"})
+        next_command = ObsTerm(func=mdp.next_command, params={"command_name": "motion_tracking"})
+        interpolation_alpha = ObsTerm(func=mdp.interpolation_alpha, params={"command_name": "motion_tracking"})
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class PolicyCfg(ObsGroup):
         base_ang_vel = ObsTerm(func=mdp.imu_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
         projected_gravity = ObsTerm(func=mdp.imu_projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
@@ -78,7 +98,6 @@ class G1TrackingObservationsCfg:
 
     @configclass
     class CriticCfg(ObsGroup):
-        motion_tracking_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "motion_tracking"})
         base_ang_vel = ObsTerm(func=mdp.imu_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
         projected_gravity = ObsTerm(func=mdp.imu_projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
@@ -87,7 +106,7 @@ class G1TrackingObservationsCfg:
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
         joint_torques = ObsTerm(func=mdp.joint_torques)
         joint_accs = ObsTerm(func=mdp.joint_accs)
-        root_link_repr_6d = ObsTerm(func=mdp.imu_repr_6d)
+        root_link_repr_6d = ObsTerm(func=mdp.imu_repr_6d, params={"add_noise": False})
         key_points_pos_b = ObsTerm(func=mdp.key_points_pos_b, params={"command_name": "motion_tracking", "asset_cfg": SceneEntityCfg("robot", body_names=G1_TRACKING_BODIES)})
         body_link_lin_vel_b = ObsTerm(func=mdp.body_link_lin_vel_b, params={"asset_cfg": SceneEntityCfg("robot", body_names=["torso_link", ".*_knee_link", ".*_ankle_roll_link", ".*_elbow_link", ".*_wrist_yaw_link"])})
         feet_lin_vel = ObsTerm(func=mdp.feet_lin_vel, params={"asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*")})
@@ -95,11 +114,17 @@ class G1TrackingObservationsCfg:
         base_mass_rel = ObsTerm(func=mdp.rigid_body_masses, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
         rigid_body_material = ObsTerm(func=mdp.rigid_body_material, params={"asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*")})
         base_com = ObsTerm(func=mdp.base_com, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
-        action_delay_legs = ObsTerm(func=mdp.action_delay, params={"actuators_names": "legs"})
-        action_delay_feet = ObsTerm(func=mdp.action_delay, params={"actuators_names": "feet"})
-        action_delay_shoulders = ObsTerm(func=mdp.action_delay, params={"actuators_names": "shoulders"})
-        action_delay_arms = ObsTerm(func=mdp.action_delay, params={"actuators_names": "arms"})
-        action_delay_wrist = ObsTerm(func=mdp.action_delay, params={"actuators_names": "wrist"})
+        action_delay_left_leg = ObsTerm(func=mdp.action_delay, params={"actuators_names": "left_leg"})
+        action_delay_left_foot = ObsTerm(func=mdp.action_delay, params={"actuators_names": "left_foot"})
+        action_delay_right_leg = ObsTerm(func=mdp.action_delay, params={"actuators_names": "right_leg"})
+        action_delay_right_foot = ObsTerm(func=mdp.action_delay, params={"actuators_names": "right_foot"})
+        action_delay_waist = ObsTerm(func=mdp.action_delay, params={"actuators_names": "waist"})
+        action_delay_left_shoulder = ObsTerm(func=mdp.action_delay, params={"actuators_names": "left_shoulder"})
+        action_delay_left_arm = ObsTerm(func=mdp.action_delay, params={"actuators_names": "left_arm"})
+        action_delay_left_wrist = ObsTerm(func=mdp.action_delay, params={"actuators_names": "left_wrist"})
+        action_delay_right_shoulder = ObsTerm(func=mdp.action_delay, params={"actuators_names": "right_shoulder"})
+        action_delay_right_arm = ObsTerm(func=mdp.action_delay, params={"actuators_names": "right_arm"})
+        action_delay_right_wrist = ObsTerm(func=mdp.action_delay, params={"actuators_names": "right_wrist"})
         push_force = ObsTerm(func=mdp.push_force, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
         push_torque = ObsTerm(func=mdp.push_torque, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
         contact_information = ObsTerm(func=mdp.contact_information, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[
@@ -116,6 +141,8 @@ class G1TrackingObservationsCfg:
             self.enable_corruption = False
             self.concatenate_terms = True
 
+    command: CommandCfg = CommandCfg()
+    fsq_command: FutureCurrentNextCommandCfg = FutureCurrentNextCommandCfg()
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
 

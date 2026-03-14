@@ -21,36 +21,29 @@ from unitree_lab.assets.robots.unitree_parallel import (
 from .tracking_env_cfg import UnitreeG1TrackingEnvCfg
 
 
+# URDF order (body-part grouped): left leg, right leg, waist, left arm, right arm
 PR_JOINT_NAMES = [
-    'left_hip_pitch_joint', 'right_hip_pitch_joint', 'waist_yaw_joint',
-    'left_hip_roll_joint', 'right_hip_roll_joint', 'waist_roll_joint',
-    'left_hip_yaw_joint', 'right_hip_yaw_joint', 'waist_pitch_joint',
-    'left_knee_joint', 'right_knee_joint',
-    'left_shoulder_pitch_joint', 'right_shoulder_pitch_joint',
-    'left_ankle_pitch_joint', 'right_ankle_pitch_joint',
-    'left_shoulder_roll_joint', 'right_shoulder_roll_joint',
-    'left_ankle_roll_joint', 'right_ankle_roll_joint',
-    'left_shoulder_yaw_joint', 'right_shoulder_yaw_joint',
-    'left_elbow_joint', 'right_elbow_joint',
-    'left_wrist_roll_joint', 'right_wrist_roll_joint',
-    'left_wrist_pitch_joint', 'right_wrist_pitch_joint',
-    'left_wrist_yaw_joint', 'right_wrist_yaw_joint',
+    'left_hip_pitch_joint', 'left_hip_roll_joint', 'left_hip_yaw_joint',
+    'left_knee_joint', 'left_ankle_pitch_joint', 'left_ankle_roll_joint',
+    'right_hip_pitch_joint', 'right_hip_roll_joint', 'right_hip_yaw_joint',
+    'right_knee_joint', 'right_ankle_pitch_joint', 'right_ankle_roll_joint',
+    'waist_yaw_joint', 'waist_roll_joint', 'waist_pitch_joint',
+    'left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint',
+    'left_elbow_joint', 'left_wrist_roll_joint', 'left_wrist_pitch_joint', 'left_wrist_yaw_joint',
+    'right_shoulder_pitch_joint', 'right_shoulder_roll_joint', 'right_shoulder_yaw_joint',
+    'right_elbow_joint', 'right_wrist_roll_joint', 'right_wrist_pitch_joint', 'right_wrist_yaw_joint',
 ]
 
 AB_JOINT_NAMES = [
-    'left_hip_pitch_joint', 'right_hip_pitch_joint', 'waist_yaw_joint',
-    'left_hip_roll_joint', 'right_hip_roll_joint', 'torso_constraint_L_joint',
-    'left_hip_yaw_joint', 'right_hip_yaw_joint', 'torso_constraint_R_joint',
-    'left_knee_joint', 'right_knee_joint',
-    'left_shoulder_pitch_joint', 'right_shoulder_pitch_joint',
-    'left_ankle_A_joint', 'right_ankle_A_joint',
-    'left_shoulder_roll_joint', 'right_shoulder_roll_joint',
-    'left_ankle_B_joint', 'right_ankle_B_joint',
-    'left_shoulder_yaw_joint', 'right_shoulder_yaw_joint',
-    'left_elbow_joint', 'right_elbow_joint',
-    'left_wrist_roll_joint', 'right_wrist_roll_joint',
-    'left_wrist_pitch_joint', 'right_wrist_pitch_joint',
-    'left_wrist_yaw_joint', 'right_wrist_yaw_joint',
+    'left_hip_pitch_joint', 'left_hip_roll_joint', 'left_hip_yaw_joint',
+    'left_knee_joint', 'left_ankle_A_joint', 'left_ankle_B_joint',
+    'right_hip_pitch_joint', 'right_hip_roll_joint', 'right_hip_yaw_joint',
+    'right_knee_joint', 'right_ankle_A_joint', 'right_ankle_B_joint',
+    'torso_constraint_L_joint', 'torso_constraint_R_joint', 'waist_yaw_joint',
+    'left_shoulder_pitch_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint',
+    'left_elbow_joint', 'left_wrist_roll_joint', 'left_wrist_pitch_joint', 'left_wrist_yaw_joint',
+    'right_shoulder_pitch_joint', 'right_shoulder_roll_joint', 'right_shoulder_yaw_joint',
+    'right_elbow_joint', 'right_wrist_roll_joint', 'right_wrist_pitch_joint', 'right_wrist_yaw_joint',
 ]
 
 
@@ -81,6 +74,21 @@ class UnitreeG1TrackingPREnvCfg(UnitreeG1TrackingEnvCfg):
         self.rewards.dof_pos_limits.params = {"asset_cfg": SceneEntityCfg("robot", joint_names=PR_JOINT_NAMES)}
 
         self.events.add_joint_default_pos = None
+
+        # Override action_delay observers to match unitree_parallel actuator names
+        from unitree_lab.tasks.motion_tracking import mdp
+        from isaaclab.managers import ObservationTermCfg as ObsTerm
+        self.observations.critic.action_delay_left_leg = ObsTerm(func=mdp.action_delay, params={"actuators_names": "legs"})
+        self.observations.critic.action_delay_left_foot = ObsTerm(func=mdp.action_delay, params={"actuators_names": "feet"})
+        self.observations.critic.action_delay_right_leg = None
+        self.observations.critic.action_delay_right_foot = None
+        self.observations.critic.action_delay_waist = None
+        self.observations.critic.action_delay_left_shoulder = ObsTerm(func=mdp.action_delay, params={"actuators_names": "shoulders"})
+        self.observations.critic.action_delay_left_arm = ObsTerm(func=mdp.action_delay, params={"actuators_names": "arms"})
+        self.observations.critic.action_delay_left_wrist = ObsTerm(func=mdp.action_delay, params={"actuators_names": "wrist"})
+        self.observations.critic.action_delay_right_shoulder = None
+        self.observations.critic.action_delay_right_arm = None
+        self.observations.critic.action_delay_right_wrist = None
 
 
 @configclass

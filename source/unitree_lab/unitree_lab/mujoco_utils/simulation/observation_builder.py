@@ -96,7 +96,8 @@ class ObservationBuilder:
         # History stacking configuration
         self.history_length = onnx_config.history_length or 1
         self.single_frame_dims = onnx_config.single_frame_dims or {}
-        self.history_newest_first = bool(getattr(onnx_config, "history_newest_first", True))
+        # IsaacLab uses oldest-first stacking by default, so default to False here.
+        self.history_newest_first = bool(getattr(onnx_config, "history_newest_first", False))
 
         # If metadata is missing, try best-effort inference from model IO dims.
         # This avoids hard-crashes like: Got 96 Expected 490.

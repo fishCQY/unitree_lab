@@ -53,6 +53,8 @@ class MotionTrackingCommand(CommandTerm):
         self.current_joint_vel = torch.zeros((env.num_envs, len(self.joint_names)), device=env.device, dtype=torch.float32)
         self.current_key_points_w = torch.zeros((env.num_envs, len(self.body_names), 3, 3), device=env.device, dtype=torch.float32)
         self.current_key_points = torch.zeros((env.num_envs, len(self.body_names), 3, 3), device=env.device, dtype=torch.float32)
+        # interpolation coefficient for (current, next) command blending (FSQ/RFSQ variants)
+        self.interpolation_alpha = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
 
     """
     Properties
@@ -80,6 +82,33 @@ class MotionTrackingCommand(CommandTerm):
 
     def command_index(self) -> torch.Tensor:
         return self._get_command_indices()
+
+    def _get_command_indices_step(self, step: int) -> torch.Tensor:
+        """Returns dataset indices for a single step offset from the current command index.
+
+        Args:
+            step: Offset w.r.t. current index. 0=current, 1=next, 2=future, ...
+        """
+        indices = self.command_counter + self.index_offset - 1 + step
+        return indices % self.dataset_length
+
+    def command_step(self, step: int) -> torch.Tensor:
+        """Returns the command vector at a specific step offset.
+
+        This is used by FSQ/RFSQ interpolation variants to expose (current/next/future)
+        commands as separate observation terms.
+        """
+        idx = self._get_command_indices_step(step)
+        return torch.cat(
+            [
+                self.repr_6d[idx, self.root_link_ids].flatten(start_dim=1),
+                self.body_linear_velocities[idx, self.root_link_ids].flatten(start_dim=1),
+                self.body_angular_velocities[idx, self.root_link_ids].flatten(start_dim=1),
+                self.joint_pos[idx][:, self.joint_indices].flatten(start_dim=1),
+                self.joint_vel[idx][:, self.joint_indices].flatten(start_dim=1),
+            ],
+            dim=-1,
+        )
 
     def _get_body_indices(self, body_name) -> torch.Tensor:
         _, body_indices = find_pattern_matches(self.body_names, body_name)
@@ -133,10 +162,18 @@ class MotionTrackingCommand(CommandTerm):
         pass
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        # Resolve env ids and number of samples
         if env_ids is None:
             env_ids = slice(None)
+            num_samples = self._env.num_envs
+        elif isinstance(env_ids, slice):
+            num_samples = len(range(*env_ids.indices(self._env.num_envs)))
+        else:
+            num_samples = len(env_ids)
         # reset the index offset with weighted sampling
-        self.index_offset[env_ids] = self._sample_indices(len(env_ids) if not isinstance(env_ids, (list, tuple)) else self._env.num_envs)
+        self.index_offset[env_ids] = self._sample_indices(num_samples)
+        # sample interpolation coefficients for FSQ/RFSQ
+        self.interpolation_alpha[env_ids] = torch.rand_like(self.interpolation_alpha[env_ids])
         # self.index_offset[env_ids] = 0
         # resample the command
         extras = super().reset(env_ids=env_ids)
@@ -145,6 +182,8 @@ class MotionTrackingCommand(CommandTerm):
         return extras
 
     def _resample_command(self, env_ids: Sequence[int]):
+        # sample interpolation coefficients for FSQ/RFSQ
+        self.interpolation_alpha[env_ids] = torch.rand_like(self.interpolation_alpha[env_ids])
         # get the current index
         index = self.command_counter[env_ids] + self.index_offset[env_ids] - 1
         index = index % self.dataset_length  # wrap around if the index exceeds the dataset length

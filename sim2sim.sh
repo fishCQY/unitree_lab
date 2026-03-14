@@ -12,7 +12,7 @@ set -euo pipefail
 
 ROBOT="${ROBOT:-g1}"
 TASK="${TASK:-rough_forward}"
-ONNX_PATH="${ONNX_PATH:-logs/rsl_rl/unitree_g1_rough/2026-03-01_10-21-45/export/policy_iter_7000.onnx}"
+ONNX_PATH="${ONNX_PATH:-logs/rsl_rl/unitree_g1_rough/2026-03-06_02-06-24/export/policy_iter_15000.onnx}"
 DEPLOY_YAML="${DEPLOY_YAML:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-eval_results}"
 

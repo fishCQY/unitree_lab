@@ -389,3 +389,27 @@ def depth_scan(
             depth_distances = normalized
     
     return depth_distances
+
+
+def current_command(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Returns the current motion tracking command vector (step=0)."""
+    cmd_term = env.command_manager.get_term(command_name)
+    return cmd_term.command_step(0)
+
+
+def next_command(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Returns the next motion tracking command vector (step=1)."""
+    cmd_term = env.command_manager.get_term(command_name)
+    return cmd_term.command_step(1)
+
+
+def future_command(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Returns the future motion tracking command vector (step=2)."""
+    cmd_term = env.command_manager.get_term(command_name)
+    return cmd_term.command_step(2)
+
+
+def interpolation_alpha(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Returns interpolation alpha for FSQ/RFSQ variants as shape (N, 1)."""
+    cmd_term = env.command_manager.get_term(command_name)
+    return cmd_term.interpolation_alpha.unsqueeze(-1)

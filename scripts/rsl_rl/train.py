@@ -39,7 +39,7 @@ parser.add_argument(
     "--sim2sim", action="store_true", default=False,
     help="Run MuJoCo sim2sim eval on each checkpoint save and upload video to W&B (requires --logger wandb).",
 )
-parser.add_argument("--sim2sim_duration", type=float, default=10.0, help="Sim2sim episode duration in seconds.")
+parser.add_argument("--sim2sim_duration", type=float, default=30.0, help="Sim2sim episode duration in seconds.")
 parser.add_argument("--sim2sim_robot", type=str, default="g1", help="MuJoCo robot name for sim2sim.")
 parser.add_argument(
     "--sim2sim_xml", type=str, default=None,
@@ -214,6 +214,20 @@ def _build_deploy_yaml_from_metadata(meta: dict) -> dict:
         for k, v in obs_scales.items():
             deploy_obs[str(k)] = {"scale": v}
         deploy["observations"] = deploy_obs
+
+    # Observation structure (recommended for sim2sim alignment)
+    # These keys are consumed by scripts/mujoco_eval/run_sim2sim_locomotion.py
+    if isinstance(meta.get("observation_names"), list):
+        deploy["observation_names"] = meta["observation_names"]
+    if isinstance(meta.get("observation_dims"), list):
+        deploy["observation_dims"] = meta["observation_dims"]
+    if meta.get("history_length") is not None:
+        try:
+            deploy["history_length"] = int(meta["history_length"])
+        except Exception:
+            pass
+    if isinstance(meta.get("single_frame_dims"), dict):
+        deploy["single_frame_dims"] = meta["single_frame_dims"]
 
     return deploy
 
@@ -440,13 +454,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # - observation layout + history stacking
             # - PD gains and timing (policy_dt/decimation/sim_dt)
             try:
-                from unitree_lab.utils.onnx_utils import build_onnx_metadata, attach_onnx_metadata
+                from unitree_lab.utils.onnx_utils import build_onnx_metadata
 
                 # build_onnx_metadata expects the underlying IsaacLab env (ManagerBasedRLEnv),
                 # not the RSL-RL wrapper.
                 base_env = getattr(env, "unwrapped", env)
                 meta = build_onnx_metadata(base_env)
-                attach_onnx_metadata(onnx_path, meta)
 
                 # Always dump a deploy.yaml next to the ONNX for robust sim2sim debugging.
                 # This does NOT require attaching metadata to ONNX.
@@ -455,8 +468,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 dump_yaml(deploy_yaml_path, deploy_yaml)
                 # Also keep a stable "latest" pointer for convenience.
                 dump_yaml(os.path.join(export_dir, "deploy_latest.yaml"), deploy_yaml)
+
+                # Best-effort: attach metadata_json to the ONNX (requires the `onnx` package).
+                try:
+                    from unitree_lab.utils.onnx_utils import attach_onnx_metadata
+                    attach_onnx_metadata(onnx_path, meta)
+                except Exception as e:
+                    print(f"[Sim2Sim][WARN] Failed to attach ONNX metadata_json (deploy.yaml still written): {e}")
             except Exception as e:
-                print(f"[Sim2Sim][WARN] Failed to attach ONNX metadata_json: {e}")
+                print(f"[Sim2Sim][WARN] Failed to build sim2sim deploy metadata: {e}")
         except Exception as e:
             print(f"[Sim2Sim][WARN] ONNX export failed: {e}")
             sim2sim_sema.release()
@@ -471,7 +491,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             sim2sim_sema.release()
             return
 
-        duration = float(getattr(args_cli, "sim2sim_duration", 5.0))
+        duration = float(getattr(args_cli, "sim2sim_duration", 30.0))
         max_steps = int(duration / 0.02)  # ~50Hz policy rate -> 250 steps for 5s
         mp4_path = os.path.join(out_dir, f"{sim2sim_task}_sim2sim.mp4")
         sim2sim_log = os.path.join(out_dir, "sim2sim.log")

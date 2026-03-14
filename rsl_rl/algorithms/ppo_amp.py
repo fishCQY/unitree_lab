@@ -135,6 +135,7 @@ class PPOAMP(PPO):
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_aux_loss = 0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -270,6 +271,14 @@ class PPOAMP(PPO):
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
+            # Auxiliary loss (optional, only for original batch)
+            aux_loss = None
+            aux_coef = float(getattr(self.policy, "aux_loss_coef", 0.0) or 0.0)
+            if aux_coef > 0.0 and hasattr(self.policy, "auxiliary_loss"):
+                aux_loss = self.policy.auxiliary_loss(obs_batch[:original_batch_size])
+                if aux_loss is not None:
+                    loss = loss + aux_coef * aux_loss
+
             # Symmetry loss
             if self.symmetry:
                 # Obtain the symmetric actions
@@ -386,6 +395,8 @@ class PPOAMP(PPO):
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+            if aux_loss is not None:
+                mean_aux_loss += aux_loss.item()
             # RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -403,6 +414,7 @@ class PPOAMP(PPO):
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_aux_loss /= num_updates
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
@@ -421,6 +433,8 @@ class PPOAMP(PPO):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if float(getattr(self.policy, "aux_loss_coef", 0.0) or 0.0) > 0.0:
+            loss_dict["aux"] = mean_aux_loss
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:

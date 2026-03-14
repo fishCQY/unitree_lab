@@ -18,6 +18,10 @@ from rsl_rl.modules import (
     ActorCritic,
     ActorCriticCNN,
     ActorCriticRecurrent,
+    ActorCriticCommandCodec,
+    ActorCriticCommandFSQ,
+    ActorCriticCommandRFSQ,
+    ActorCriticCommandVQVAE,
     resolve_rnd_config,
     resolve_symmetry_config,
 )

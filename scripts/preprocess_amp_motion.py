@@ -5,36 +5,41 @@ import pickle
 import numpy as np
 from pathlib import Path
 
-# G1 29-DOF default joint positions (Lab joint order, from unitree.py UNITREE_G1_CFG)
+# G1 29-DOF default joint positions in URDF order (body-part grouped)
 DEFAULT_JOINT_POS = np.array([
+    # -- left leg --
     -0.20,   # 0:  left_hip_pitch
-    -0.20,   # 1:  right_hip_pitch
-     0.00,   # 2:  waist_yaw
-     0.00,   # 3:  left_hip_roll
-     0.00,   # 4:  right_hip_roll
-     0.00,   # 5:  waist_roll
-     0.00,   # 6:  left_hip_yaw
-     0.00,   # 7:  right_hip_yaw
-     0.00,   # 8:  waist_pitch
-     0.42,   # 9:  left_knee
-     0.42,   # 10: right_knee
-     0.35,   # 11: left_shoulder_pitch
-     0.35,   # 12: right_shoulder_pitch
-    -0.23,   # 13: left_ankle_pitch
-    -0.23,   # 14: right_ankle_pitch
-     0.18,   # 15: left_shoulder_roll
-    -0.18,   # 16: right_shoulder_roll
-     0.00,   # 17: left_ankle_roll
-     0.00,   # 18: right_ankle_roll
-     0.00,   # 19: left_shoulder_yaw
-     0.00,   # 20: right_shoulder_yaw
-     0.87,   # 21: left_elbow
-     0.87,   # 22: right_elbow
-     0.00,   # 23: left_wrist_roll
-     0.00,   # 24: right_wrist_roll
-     0.00,   # 25: left_wrist_pitch
-     0.00,   # 26: right_wrist_pitch
-     0.00,   # 27: left_wrist_yaw
+     0.00,   # 1:  left_hip_roll
+     0.00,   # 2:  left_hip_yaw
+     0.42,   # 3:  left_knee
+    -0.23,   # 4:  left_ankle_pitch
+     0.00,   # 5:  left_ankle_roll
+    # -- right leg --
+    -0.20,   # 6:  right_hip_pitch
+     0.00,   # 7:  right_hip_roll
+     0.00,   # 8:  right_hip_yaw
+     0.42,   # 9:  right_knee
+    -0.23,   # 10: right_ankle_pitch
+     0.00,   # 11: right_ankle_roll
+    # -- waist --
+     0.00,   # 12: waist_yaw
+     0.00,   # 13: waist_roll
+     0.00,   # 14: waist_pitch
+    # -- left arm --
+     0.35,   # 15: left_shoulder_pitch
+     0.18,   # 16: left_shoulder_roll
+     0.00,   # 17: left_shoulder_yaw
+     0.87,   # 18: left_elbow
+     0.00,   # 19: left_wrist_roll
+     0.00,   # 20: left_wrist_pitch
+     0.00,   # 21: left_wrist_yaw
+    # -- right arm --
+     0.35,   # 22: right_shoulder_pitch
+    -0.18,   # 23: right_shoulder_roll
+     0.00,   # 24: right_shoulder_yaw
+     0.87,   # 25: right_elbow
+     0.00,   # 26: right_wrist_roll
+     0.00,   # 27: right_wrist_pitch
      0.00,   # 28: right_wrist_yaw
 ], dtype=np.float64)
 
@@ -114,7 +119,17 @@ def preprocess_file(pkl_path):
 
 
 def main():
-    data_dir = Path("source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/walk_and_run")
+    import argparse
+    parser = argparse.ArgumentParser(description="Preprocess AMP motion PKL files (compute dof_vel, proj_grav, etc.)")
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="source/unitree_lab/unitree_lab/data/MotionData/g1_29dof/amp/lafan",
+        help="Directory containing PKL motion files",
+    )
+    args = parser.parse_args()
+
+    data_dir = Path(args.data_dir)
     pkl_files = sorted(data_dir.glob("*.pkl"))
     print(f"Preprocessing {len(pkl_files)} motion files in {data_dir}\n")
     for f in pkl_files:
