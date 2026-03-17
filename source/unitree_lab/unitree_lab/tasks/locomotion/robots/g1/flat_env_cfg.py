@@ -39,7 +39,7 @@ class UnitreeG1FlatEnvCfg(UnitreeG1RoughEnvCfg):
         self.observations.critic.height_scan = None
         # No terrain curriculum; use velocity command curriculum instead
         self.curriculum.terrain_levels = None
-        self.curriculum.command_levels_vel = CurrTerm(
+        self.curriculum.command_levels = CurrTerm(
             func=mdp.command_levels_vel,
             params={
                 "delta": [0.1, 0.1, 0.1],

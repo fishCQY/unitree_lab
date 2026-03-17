@@ -52,8 +52,12 @@ class AMPRunner(OnPolicyRunner):
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
-            self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
+            self.env.episode_length_buf = torch.randint(
+                low=1,
+                high=int(self.env.max_episode_length),
+                size=self.env.episode_length_buf.shape,
+                dtype=self.env.episode_length_buf.dtype,
+                device=self.env.episode_length_buf.device,
             )
 
         # Start learning
@@ -151,24 +155,30 @@ class AMPRunner(OnPolicyRunner):
         # Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
         # Load RND model if used
-        if self.alg_cfg["rnd_cfg"]:
+        if self.alg_cfg["rnd_cfg"] and "rnd_state_dict" in loaded_dict:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
         # Load AMP model
-        self.alg.amp_discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"])
-        self.alg.amp_discriminator.disc_obs_normalizer.load_state_dict(loaded_dict["amp_discriminator_normalizer_state_dict"])
+        if "amp_discriminator_state_dict" in loaded_dict:
+            self.alg.amp_discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"])
+        if "amp_discriminator_normalizer_state_dict" in loaded_dict:
+            self.alg.amp_discriminator.disc_obs_normalizer.load_state_dict(
+                loaded_dict["amp_discriminator_normalizer_state_dict"]
+            )
         # Load optimizer if used
         if load_optimizer and resumed_training:
             # Algorithm optimizer
-            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            if "optimizer_state_dict" in loaded_dict:
+                self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             # RND optimizer if used
-            if self.alg_cfg["rnd_cfg"]:
+            if self.alg_cfg["rnd_cfg"] and "rnd_optimizer_state_dict" in loaded_dict:
                 self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
             # AMP discriminator optimizer
-            self.alg.disc_optimizer.load_state_dict(loaded_dict["amp_discriminator_optimizer_state_dict"])
+            if "amp_discriminator_optimizer_state_dict" in loaded_dict:
+                self.alg.disc_optimizer.load_state_dict(loaded_dict["amp_discriminator_optimizer_state_dict"])
         # Load current learning iteration
         if resumed_training:
-            self.current_learning_iteration = loaded_dict["iter"]
-        return loaded_dict["infos"]
+            self.current_learning_iteration = loaded_dict.get("iter", 0)
+        return loaded_dict.get("infos", {})
 
     def train_mode(self):
         super().train_mode()

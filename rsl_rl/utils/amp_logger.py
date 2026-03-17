@@ -87,11 +87,9 @@ class LoggerAMP(Logger):
                 self.irewbuffer.extend(self.cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
                 self.cur_ereward_sum[new_ids] = 0
                 self.cur_ireward_sum[new_ids] = 0
-            if style_rewards is not None and total_rewards is not None:
-                amp_new_ids = new_ids if len(new_ids)>0 else slice(None)
-                style_rew_episode_mean = torch.mean(self.cur_style_reward_sum[amp_new_ids]) / (self.max_episode_length_s)
-                if len(new_ids) > 0:
-                    self.ep_extras[-1]["Episode_Reward/style"] = style_rew_episode_mean.item()
+            if style_rewards is not None and total_rewards is not None and len(new_ids) > 0:
+                style_rew_episode_mean = torch.mean(self.cur_style_reward_sum[new_ids]) / (self.max_episode_length_s)
+                self.ep_extras[-1]["Episode_Reward/style"] = style_rew_episode_mean.item()
                 self.total_rewbuffer.extend(self.cur_total_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                 self.style_rewbuffer.extend(self.cur_style_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                 self.cur_style_reward_sum[new_ids] = 0
@@ -163,8 +161,10 @@ class LoggerAMP(Logger):
                     self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(self.erewbuffer), it)
                     self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(self.irewbuffer), it)
                     self.writer.add_scalar("Rnd/weight", rnd_weight, it)
-                self.writer.add_scalar("AMP/mean_total_reward", statistics.mean(self.total_rewbuffer), it)
-                self.writer.add_scalar("AMP/mean_style_reward", statistics.mean(self.style_rewbuffer), it)
+                if len(self.total_rewbuffer) > 0:
+                    self.writer.add_scalar("AMP/mean_total_reward", statistics.mean(self.total_rewbuffer), it)
+                if len(self.style_rewbuffer) > 0:
+                    self.writer.add_scalar("AMP/mean_style_reward", statistics.mean(self.style_rewbuffer), it)
                 self.writer.add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
                 self.writer.add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
                 if self.logger_type != "wandb":
@@ -200,8 +200,10 @@ class LoggerAMP(Logger):
                 if self.cfg["algorithm"]["rnd_cfg"]:
                     log_string += f"""{"Mean extrinsic reward:":>{pad}} {statistics.mean(self.erewbuffer):.2f}\n"""
                     log_string += f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(self.irewbuffer):.2f}\n"""
-                log_string += f"""{"Mean AMP total reward:":>{pad}} {statistics.mean(self.total_rewbuffer):.2f}\n"""
-                log_string += f"""{"Mean AMP style reward:":>{pad}} {statistics.mean(self.style_rewbuffer):.2f}\n"""
+                if len(self.total_rewbuffer) > 0:
+                    log_string += f"""{"Mean AMP total reward:":>{pad}} {statistics.mean(self.total_rewbuffer):.2f}\n"""
+                if len(self.style_rewbuffer) > 0:
+                    log_string += f"""{"Mean AMP style reward:":>{pad}} {statistics.mean(self.style_rewbuffer):.2f}\n"""
                 log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
                 log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
 

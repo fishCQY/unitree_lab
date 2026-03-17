@@ -388,8 +388,9 @@ class PPOAMP(PPO):
             # Apply the gradients for AMP discriminator
             nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.disc_max_grad_norm)
             self.disc_optimizer.step()
-            # Update the AMP normalizer
+            # Update the AMP normalizer with both agent and demo observations
             self.amp_discriminator.update_normalization(disc_obs_batch)
+            self.amp_discriminator.update_normalization(disc_demo_obs_batch)
 
             # Store the losses
             mean_value_loss += value_loss.item()
@@ -445,3 +446,30 @@ class PPOAMP(PPO):
         loss_dict["amp/disc_demo_score"] = mean_disc_demo_score
 
         return loss_dict
+
+    def broadcast_parameters(self) -> None:
+        """Broadcast model parameters including AMP discriminator to all GPUs."""
+        super().broadcast_parameters()
+        disc_params = [self.amp_discriminator.state_dict()]
+        torch.distributed.broadcast_object_list(disc_params, src=0)
+        self.amp_discriminator.load_state_dict(disc_params[0])
+
+    def reduce_parameters(self) -> None:
+        """Collect gradients from all GPUs including AMP discriminator."""
+        super().reduce_parameters()
+        disc_grads = [
+            param.grad.view(-1)
+            for param in self.amp_discriminator.parameters()
+            if param.grad is not None
+        ]
+        if not disc_grads:
+            return
+        all_disc_grads = torch.cat(disc_grads)
+        torch.distributed.all_reduce(all_disc_grads, op=torch.distributed.ReduceOp.SUM)
+        all_disc_grads /= self.gpu_world_size
+        offset = 0
+        for param in self.amp_discriminator.parameters():
+            if param.grad is not None:
+                numel = param.numel()
+                param.grad.data.copy_(all_disc_grads[offset : offset + numel].view_as(param.grad.data))
+                offset += numel

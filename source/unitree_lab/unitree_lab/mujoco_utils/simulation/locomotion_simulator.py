@@ -38,7 +38,7 @@ class LocomotionMujocoSimulator(BaseMujocoSimulator):
         config_override: dict[str, Any] | None = None,
     ):
         # Initialize with Base class (loads ONNX + MuJoCo model)
-        super().__init__(onnx_path=onnx_path, mujoco_model_path=xml_path)
+        super().__init__(xml_path=xml_path, onnx_path=onnx_path, config_override=config_override)
 
         # Ensure mapping index is integer (some ONNX exports store joint_names as np arrays).
         try:
@@ -416,16 +416,34 @@ class LocomotionMujocoSimulator(BaseMujocoSimulator):
         target_q = current_action_scaled + self.default_joint_pos
         target_dq = np.zeros_like(target_q)
 
-        # Wheels: velocity control
-        if self.is_wheel_mask.shape[0] == target_q.shape[0] and bool(np.any(self.is_wheel_mask)):
-            target_q[self.is_wheel_mask] = 0.0
-            target_dq[self.is_wheel_mask] = current_action_scaled[self.is_wheel_mask]
-
         q = np.asarray(self.data.qpos[self._qpos_adrs], dtype=np.float64)
         dq = np.asarray(self.data.qvel[self._dof_adrs], dtype=np.float64)
 
-        from ..core.physics import pd_control
+        from ..core.physics import pd_control, pd_control_velocity
 
-        torque, _ = pd_control(target_q, q, self.p_gains, target_dq, dq, self.d_gains, self.tau_limit)
+        has_wheels = (
+            self.is_wheel_mask.shape[0] == target_q.shape[0]
+            and bool(np.any(self.is_wheel_mask))
+        )
+
+        if has_wheels:
+            wheel = self.is_wheel_mask
+            non_wheel = ~wheel
+            torque = np.zeros_like(target_q)
+            torque[non_wheel] = pd_control(
+                target_q[non_wheel], q[non_wheel], dq[non_wheel],
+                self.p_gains[non_wheel], self.d_gains[non_wheel],
+                self.tau_limits[non_wheel],
+            )
+            torque[wheel] = pd_control_velocity(
+                current_action_scaled[wheel], dq[wheel],
+                self.d_gains[wheel], self.tau_limits[wheel],
+            )
+        else:
+            torque = pd_control(
+                target_q, q, dq,
+                self.p_gains, self.d_gains, self.tau_limits,
+            )
+
         self.data.ctrl[:] = torque
 

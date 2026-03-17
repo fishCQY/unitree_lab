@@ -287,11 +287,11 @@ def body_link_lin_vel_b(
     env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     asset: RigidObject = env.scene[asset_cfg.name]
-    body_ang_vel_b = math_utils.quat_apply_inverse(
+    body_lin_vel_b = math_utils.quat_apply_inverse(
         asset.data.body_link_quat_w[:, asset_cfg.body_ids],
-        asset.data.body_link_ang_vel_w[:, asset_cfg.body_ids]
+        asset.data.body_link_lin_vel_w[:, asset_cfg.body_ids]
     )
-    return body_ang_vel_b.flatten(1)
+    return body_lin_vel_b.flatten(1)
 
 
 def body_link_ang_vel_b(

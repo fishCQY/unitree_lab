@@ -67,8 +67,12 @@ class OnPolicyRunner:
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Randomize initial episode lengths (for exploration)
         if init_at_random_ep_len:
-            self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
+            self.env.episode_length_buf = torch.randint(
+                low=1,
+                high=int(self.env.max_episode_length),
+                size=self.env.episode_length_buf.shape,
+                dtype=self.env.episode_length_buf.dtype,
+                device=self.env.episode_length_buf.device,
             )
 
         # Start learning

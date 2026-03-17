@@ -82,9 +82,9 @@ def joint_power_l2(
 
 class action_smoothness_l2(ManagerTermBase):
     def __init__(
-        self, env: ManagerBasedRLEnv, cfg: SceneEntityCfg = SceneEntityCfg("robot")
+        self, cfg: RewardTermCfg, env: ManagerBasedRLEnv,
     ):
-        super().__init__(env, cfg)
+        super().__init__(cfg, env)
         self.prev_prev_action = None
 
     def __call__(
@@ -200,7 +200,7 @@ def track_lin_vel_xy_yaw_frame_exp(
 ) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
     vel_yaw = math_utils.quat_apply_inverse(
-        math_utils.yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+        math_utils.yaw_quat(asset.data.root_link_quat_w), asset.data.root_link_lin_vel_w[:, :3]
     )
     lin_vel_error = torch.sum(torch.square(env.command_manager.get_command(command_name)[:, :2] - vel_yaw[:, :2]), dim=1)
     return torch.exp(-lin_vel_error / std**2)
@@ -210,7 +210,7 @@ def track_ang_vel_z_world_exp(
     env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
-    ang_vel_error = torch.square(env.command_manager.get_command(command_name)[:, 2] - asset.data.root_ang_vel_w[:, 2])
+    ang_vel_error = torch.square(env.command_manager.get_command(command_name)[:, 2] - asset.data.root_link_ang_vel_w[:, 2])
     return torch.exp(-ang_vel_error / std**2)
 
 
@@ -269,7 +269,7 @@ def body_orientation_l2(
 ) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
     body_orientation = math_utils.quat_apply_inverse(
-        asset.data.body_quat_w[:, asset_cfg.body_ids[0], :], asset.data.GRAVITY_VEC_W
+        asset.data.body_link_quat_w[:, asset_cfg.body_ids[0], :], asset.data.GRAVITY_VEC_W
     )
     return torch.sum(torch.square(body_orientation[:, :2]), dim=1)
 
@@ -278,10 +278,10 @@ def body_lin_vel_z_l2(
     env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """Penalize z-axis base linear velocity using L2 squared kernel."""
-    # extract the used quantities (to enable type-hinting)
     asset: RigidObject = env.scene[asset_cfg.name]
     body_lin_vel_b = math_utils.quat_apply_inverse(
-        asset.data.body_quat_w[:, asset_cfg.body_ids[0], :], asset.data.body_lin_vel_w[:, asset_cfg.body_ids[0], :]
+        asset.data.body_link_quat_w[:, asset_cfg.body_ids[0], :],
+        asset.data.body_link_lin_vel_w[:, asset_cfg.body_ids[0], :],
     )
     return torch.square(body_lin_vel_b[:, 2])
 
@@ -290,10 +290,10 @@ def body_ang_vel_xy_l2(
     env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """Penalize xy-axis base angular velocity using L2 squared kernel."""
-    # extract the used quantities (to enable type-hinting)
     asset: RigidObject = env.scene[asset_cfg.name]
     body_ang_vel_b = math_utils.quat_apply_inverse(
-        asset.data.body_quat_w[:, asset_cfg.body_ids[0], :], asset.data.body_ang_vel_w[:, asset_cfg.body_ids[0], :]
+        asset.data.body_link_quat_w[:, asset_cfg.body_ids[0], :],
+        asset.data.body_link_ang_vel_w[:, asset_cfg.body_ids[0], :],
     )
     return torch.sum(torch.square(body_ang_vel_b[:, :2]), dim=1)
 

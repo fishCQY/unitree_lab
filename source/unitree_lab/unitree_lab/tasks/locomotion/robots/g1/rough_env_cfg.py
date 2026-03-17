@@ -36,13 +36,17 @@ from unitree_lab.sensors.ray_caster import NoiseRayCasterCameraCfg
 from unitree_lab.sensors.imu import DelayedImuCfg
 
 # AMP demonstration motions:
-# Use walk_and_run subset for discriminator demos.
+# Use LAFAN locomotion subset (walk/run/sprint) for discriminator demos.
 _AMP_ROOT_DIR = Path(__file__).resolve().parents[4] / "data" / "MotionData" / "g1_29dof" / "amp"
-_AMP_WALK_RUN_DIR = _AMP_ROOT_DIR / "walk_and_run"
+_AMP_LAFAN_DIR = _AMP_ROOT_DIR / "lafan"
 
+_LOCOMOTION_PREFIXES = ("walk", "run", "sprint")
 _AMP_MOTION_FILES = []
-if _AMP_WALK_RUN_DIR.exists():
-    _AMP_MOTION_FILES = sorted(_AMP_WALK_RUN_DIR.glob("*.pkl"))
+if _AMP_LAFAN_DIR.exists():
+    _AMP_MOTION_FILES = sorted(
+        f for f in _AMP_LAFAN_DIR.glob("*.pkl")
+        if any(f.stem.startswith(p) for p in _LOCOMOTION_PREFIXES)
+    )
 
 
 # =============================================================================
@@ -359,6 +363,9 @@ class UnitreeG1RoughEnvCfg(LocomotionEnvCfg):
         self.rewards.body_orientation_l2.weight = -1.0
         self.rewards.fly.weight = 0.0
         self.rewards.feet_force.weight = 0.0
+        # Disable depth-camera observation groups to save VRAM
+        self.observations.debug = None
+        self.observations.image = None
 
 
 @configclass

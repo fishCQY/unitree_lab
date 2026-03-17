@@ -55,6 +55,8 @@ class WandbSummaryWriter(SummaryWriter):
         walltime: float | None = None,
         new_style: bool = False,
     ) -> None:
+        if hasattr(scalar_value, "item"):
+            scalar_value = scalar_value.item()
         super().add_scalar(
             tag,
             scalar_value,
@@ -65,6 +67,7 @@ class WandbSummaryWriter(SummaryWriter):
         wandb.log({tag: scalar_value}, step=global_step)
 
     def stop(self) -> None:
+        self.close()
         wandb.finish()
 
     def save_model(self, model_path: str, it: int) -> None:

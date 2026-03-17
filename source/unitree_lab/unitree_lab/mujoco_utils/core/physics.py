@@ -106,12 +106,15 @@ def apply_onnx_physics_params(
             try:
                 joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
                 if joint_id >= 0:
-                    if attr_name == "armature":
-                        model.dof_armature[joint_id] = value
-                    elif attr_name == "damping":
-                        model.dof_damping[joint_id] = value
-                    elif attr_name == "frictionloss":
-                        model.dof_frictionloss[joint_id] = value
+                    dof_adr = model.jnt_dofadr[joint_id]
+                    dof_num = {0: 6, 1: 3, 2: 1, 3: 1}[int(model.jnt_type[joint_id])]
+                    for i in range(dof_num):
+                        if attr_name == "armature":
+                            model.dof_armature[dof_adr + i] = value
+                        elif attr_name == "damping":
+                            model.dof_damping[dof_adr + i] = value
+                        elif attr_name == "frictionloss":
+                            model.dof_frictionloss[dof_adr + i] = value
             except Exception as e:
                 print(f"Warning: Could not apply {attr_name} to joint {joint_name}: {e}")
     

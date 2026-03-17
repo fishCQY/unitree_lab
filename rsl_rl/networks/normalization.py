@@ -92,7 +92,7 @@ class EmpiricalDiscountedVariationNormalization(nn.Module):
             self.emp_norm.update(avg)
 
         # Normalize rewards with the empirical std
-        if self.emp_norm._std > 0:
+        if (self.emp_norm._std > 0).all().item():
             return rew / self.emp_norm._std
         else:
             return rew
