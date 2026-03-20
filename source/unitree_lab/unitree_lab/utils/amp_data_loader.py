@@ -153,6 +153,24 @@ class AMPMotionData:
         return sequences
 
 
+def _flatten_motion_pkl(raw: Any) -> list[dict]:
+    """Normalize PKL payload to a flat list of clip dicts.
+
+    Supports three formats:
+      - list[dict]:  already flat → return as-is
+      - dict with feature keys (e.g. "dof_pos" at top level): single clip → [raw]
+      - dict of dicts ({clip_name: clip_data}): nested → list(raw.values())
+    """
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        first_val = next(iter(raw.values()), None)
+        if isinstance(first_val, dict):
+            return list(raw.values())
+        return [raw]
+    raise TypeError(f"Unexpected PKL payload type: {type(raw)}")
+
+
 def load_amp_motion_data(
     motion_files: str | Path | Sequence[str | Path],
     keys: Sequence[str],
@@ -188,20 +206,19 @@ def load_amp_motion_data(
             raise FileNotFoundError(f"Motion file not found: {motion_file}")
 
         with open(motion_file, "rb") as f:
-            motion = pickle.load(f)
+            raw = pickle.load(f)
 
-        # Extract features
-        features = _extract_features(motion, keys, point_indices)
-        all_features.append(features)
-        motion_lengths.append(features.shape[0])
+        for motion in _flatten_motion_pkl(raw):
+            features = _extract_features(motion, keys, point_indices)
+            all_features.append(features)
+            motion_lengths.append(features.shape[0])
 
-        # Mirror augmentation
-        if mirror and joint_mirror_indices is not None:
-            mirrored = _mirror_features(
-                features, keys, motion, joint_mirror_indices, joint_mirror_signs
-            )
-            all_features.append(mirrored)
-            motion_lengths.append(mirrored.shape[0])
+            if mirror and joint_mirror_indices is not None:
+                mirrored = _mirror_features(
+                    features, keys, motion, joint_mirror_indices, joint_mirror_signs
+                )
+                all_features.append(mirrored)
+                motion_lengths.append(mirrored.shape[0])
 
     # Concatenate all motions
     motion_data = torch.cat(all_features, dim=0).to(device)
@@ -266,22 +283,21 @@ def load_conditional_amp_data(
                 continue
 
             with open(motion_file, "rb") as f:
-                motion = pickle.load(f)
+                raw = pickle.load(f)
 
-            # Extract features
-            features = _extract_features(motion, keys, point_indices)
-            all_features.append(features)
-            motion_lengths.append(features.shape[0])
-            condition_ids.append(cond_idx)
-
-            # Mirror augmentation
-            if mirror and joint_mirror_indices is not None:
-                mirrored = _mirror_features(
-                    features, keys, motion, joint_mirror_indices, joint_mirror_signs
-                )
-                all_features.append(mirrored)
-                motion_lengths.append(mirrored.shape[0])
+            for motion in _flatten_motion_pkl(raw):
+                features = _extract_features(motion, keys, point_indices)
+                all_features.append(features)
+                motion_lengths.append(features.shape[0])
                 condition_ids.append(cond_idx)
+
+                if mirror and joint_mirror_indices is not None:
+                    mirrored = _mirror_features(
+                        features, keys, motion, joint_mirror_indices, joint_mirror_signs
+                    )
+                    all_features.append(mirrored)
+                    motion_lengths.append(mirrored.shape[0])
+                    condition_ids.append(cond_idx)
 
     if not all_features:
         raise ValueError("No valid motion files found")

@@ -243,28 +243,14 @@ class G1ObservationsCfg:
     class AmpCfg(ObsGroup):
         """Single-step AMP features for AMPPlugin (2D output).
 
-        Used with the plugin-based AMP runner. Each term outputs a
-        standard (num_envs, dim) tensor; the AMPPlugin constructs
-        multi-frame sequences internally from the rollout storage.
+        Must match the offline data keys exactly:
+          dof_pos(29) + dof_vel(29) + root_angle_vel(3) + proj_grav(3) = 64 dim/frame.
+        The AMPPlugin builds multi-frame sequences internally from rollout storage.
         """
         joint_pos = ObsTerm(func=mdp.amp_joint_pos, params={"asset_cfg": SceneEntityCfg("robot")})
         joint_vel = ObsTerm(func=mdp.amp_joint_vel, params={"asset_cfg": SceneEntityCfg("robot")})
         base_ang_vel = ObsTerm(func=mdp.amp_base_ang_vel, params={"asset_cfg": SceneEntityCfg("robot")})
         projected_gravity = ObsTerm(func=mdp.amp_projected_gravity, params={"asset_cfg": SceneEntityCfg("robot")})
-        body_pos_b = ObsTerm(
-            func=mdp.amp_body_pos_b,
-            params={
-                "asset_cfg": SceneEntityCfg(
-                    "robot",
-                    body_names=[
-                        "left_knee_link",
-                        "right_knee_link",
-                        "left_shoulder_roll_link",
-                        "right_shoulder_roll_link",
-                    ],
-                ),
-            },
-        )
 
         def __post_init__(self):
             self.enable_corruption = False
