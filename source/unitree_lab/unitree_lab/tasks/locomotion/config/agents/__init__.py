@@ -2,20 +2,16 @@
 
 from .rsl_rl_ppo_cfg import (
     ActorCriticDepthCfg,
-    AMPCfg,
-    RslRlPpoAlgorithmCfg,
-    UnitreeG1RoughPPORunnerCfg,
-    UnitreeG1FlatPPORunnerCfg,
-    UnitreeG1RoughPPORunnerGRUCfg,
-    UnitreeG1RoughDepthPPORunnerCfg,
+    AMPPluginCfg,
+    UnitreeG1RoughPluginRunnerCfg,
+    UnitreeG1FlatPluginRunnerCfg,
+    UnitreeG1RoughPluginGRURunnerCfg,
 )
 
 __all__ = [
     "ActorCriticDepthCfg",
-    "AMPCfg",
-    "RslRlPpoAlgorithmCfg",
-    "UnitreeG1RoughPPORunnerCfg",
-    "UnitreeG1FlatPPORunnerCfg",
-    "UnitreeG1RoughPPORunnerGRUCfg",
-    "UnitreeG1RoughDepthPPORunnerCfg",
+    "AMPPluginCfg",
+    "UnitreeG1RoughPluginRunnerCfg",
+    "UnitreeG1FlatPluginRunnerCfg",
+    "UnitreeG1RoughPluginGRURunnerCfg",
 ]

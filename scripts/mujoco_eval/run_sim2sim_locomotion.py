@@ -638,8 +638,7 @@ def run_interactive(
 
     try:
         while viewer.is_running():
-            if teleop_ctrl is not None:
-                simulator.spawn_root_z_offset = initial_spawn_z 
+            simulator.spawn_root_z_offset = initial_spawn_z
             simulator.reset()
             if teleop_ctrl is not None:
                 simulator.set_velocity_command(*teleop_ctrl.command)

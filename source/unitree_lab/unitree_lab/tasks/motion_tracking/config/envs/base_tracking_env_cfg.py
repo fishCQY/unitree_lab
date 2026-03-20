@@ -135,27 +135,29 @@ class BaseTrackingObservationsCfg:
 
 @configclass
 class BaseTrackingEventCfg:
-    physics_material = EventTerm(func=mdp.randomize_rigid_body_material, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names=".*"), "static_friction_range": (0.6, 1.0), "dynamic_friction_range": (0.4, 0.8), "restitution_range": (0.0, 1.0), "num_buckets": 64})
-    add_base_mass = EventTerm(func=mdp.randomize_rigid_body_mass, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "mass_distribution_params": (-5.0, 5.0), "operation": "add"})
-    randomize_rigid_body_com = EventTerm(func=mdp.randomize_rigid_body_com, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.05, 0.05)}})
-    scale_joint_armature = EventTerm(func=mdp.randomize_joint_parameters, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint"), "armature_distribution_params": (0.8, 1.2), "operation": "scale"})
-    base_external_force_torque = EventTerm(func=mdp.apply_external_force_torque_stochastic, mode="interval", interval_range_s=(0.0, 0.0), params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "force_range": {"x": (-1000.0, 1000.0), "y": (-1000.0, 1000.0), "z": (-500.0, 500.0)}, "torque_range": {"x": (-0.0, 0.0), "y": (-0.0, 0.0), "z": (-0.0, 0.0)}, "probability": 0.002})
+    physics_material = EventTerm(func=mdp.randomize_rigid_body_material, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names=".*"), "static_friction_range": (0.2, 1.3), "dynamic_friction_range": (0.2, 1.3), "restitution_range": (0.0, 0.8), "num_buckets": 64})
+    add_base_mass = EventTerm(func=mdp.randomize_rigid_body_mass, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "mass_distribution_params": (1.0, 1.2), "operation": "scale"})
+    randomize_rigid_body_com = EventTerm(func=mdp.randomize_rigid_body_com, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "com_range": {"x": (-0.025, 0.025), "y": (-0.025, 0.025), "z": (-0.025, 0.025)}})
+    scale_joint_armature = EventTerm(func=mdp.randomize_joint_parameters, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint"), "armature_distribution_params": (0.75, 1.25), "operation": "scale"})
+    base_external_force_torque = EventTerm(func=mdp.apply_external_force_torque_stochastic, mode="interval", interval_range_s=(3.7, 4.2), params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "force_range": {"x": (-200.0, 200.0), "y": (-200.0, 200.0), "z": (-100.0, 100.0)}, "torque_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)}, "probability": 1.0})
     reset_base = EventTerm(func=mdp.reset_root_state_uniform, mode="reset", params={"pose_range": {"x": (-0.7, 0.7), "y": (-0.7, 0.7)}, "velocity_range": {}})
 
 
 @configclass
 class BaseTrackingRewardsCfg:
-    """Base reward terms for motion tracking. Body names must be overridden per robot."""
+    """Base reward terms for motion tracking. Aligned with bfm_training DeepMimic."""
 
-    tracking_joint_pos = RewTerm(func=mdp.tracking_joint_pos_exp, weight=1.0, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]), "command_name": "motion_tracking", "std": math.sqrt(0.1)})
-    tracking_joint_vel = RewTerm(func=mdp.tracking_joint_vel_exp, weight=0.5, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]), "command_name": "motion_tracking", "std": math.sqrt(5.0)})
-    energy = RewTerm(func=mdp.energy, weight=-1e-3)
-    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-0.5e-7)
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    # --- Core tracking rewards (aligned with bfm_training) ---
+    tracking_joint_pos = RewTerm(func=mdp.tracking_joint_pos_exp, weight=1.0, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]), "command_name": "motion_tracking", "std": math.sqrt(0.25)})
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.3)
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
-    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-2.0)
-    feet_stumble = RewTerm(func=mdp.feet_stumble, weight=-2.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*ankle_roll.*"])})
-    feet_slide = RewTerm(func=mdp.feet_slide, weight=-0.25, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll.*")})
+    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-1.0)
+    # --- Retained but disabled (weight=0) ---
+    tracking_joint_vel = RewTerm(func=mdp.tracking_joint_vel_exp, weight=0.0, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]), "command_name": "motion_tracking", "std": math.sqrt(5.0)})
+    energy = RewTerm(func=mdp.energy, weight=0.0)
+    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=0.0)
+    feet_stumble = RewTerm(func=mdp.feet_stumble, weight=0.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*ankle_roll.*"])})
+    feet_slide = RewTerm(func=mdp.feet_slide, weight=0.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll.*")})
 
 
 @configclass
@@ -193,7 +195,7 @@ class TrackingEnvCfg(ManagerBasedRLEnvCfg):
 
     def __post_init__(self):
         self.decimation = 4
-        self.episode_length_s = 20.0
+        self.episode_length_s = 10.0
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material

@@ -242,8 +242,8 @@ class BatchEvaluator:
         # OpenCV often writes mp4v (MPEG-4 Part 2), which some browsers can't play in W&B.
         # We write with mp4v for compatibility then transcode to H.264 (best-effort) if ffmpeg exists.
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        # Encode at a fixed FPS for consistent W&B playback.
-        fps = 60
+        policy_dt = getattr(simulator, "policy_dt", 0.02)
+        fps = max(1, int(round(1.0 / policy_dt)))
         writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
         
         for frame in frames:

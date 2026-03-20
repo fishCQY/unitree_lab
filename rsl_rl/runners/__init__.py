@@ -7,6 +7,6 @@
 
 from .on_policy_runner import OnPolicyRunner  # noqa: I001
 from .distillation_runner import DistillationRunner
-from .amp_runner import AMPRunner  # noqa: F401
+from .amp_plugin_runner import AMPPluginRunner  # noqa: F401
 
-__all__ = ["DistillationRunner", "OnPolicyRunner", "AMPRunner"]
+__all__ = ["DistillationRunner", "OnPolicyRunner", "AMPPluginRunner"]

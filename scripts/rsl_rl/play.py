@@ -97,7 +97,7 @@ import os
 import time
 import torch
 
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner, AMPRunner
+from rsl_rl.runners import DistillationRunner, OnPolicyRunner, AMPPluginRunner
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -181,8 +181,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load previously trained model
     agent_dict = agent_cfg.to_dict()
 
-    if agent_cfg.class_name == "AMPRunner":
-        runner = AMPRunner(env, agent_dict, log_dir=None, device=agent_cfg.device)
+    if agent_cfg.class_name == "AMPPluginRunner":
+        runner = AMPPluginRunner(env, agent_dict, log_dir=None, device=agent_cfg.device)
     elif agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_dict, log_dir=None, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":

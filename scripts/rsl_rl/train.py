@@ -98,7 +98,7 @@ import numpy as np
 import torch
 from datetime import datetime
 
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner, AMPRunner
+from rsl_rl.runners import DistillationRunner, OnPolicyRunner, AMPPluginRunner
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -239,7 +239,8 @@ def _find_sim2sim_resources(task: str = "flat_forward"):
     terrain XML is preferred so that ``run_sim2sim_locomotion.py`` can inject
     course/heightfield geometry.  For flat tasks the plain scene XML is used.
     """
-    rl_lab_root = Path.home() / "unitree_lab"
+    # Resolve project root from this file's location instead of hardcoding ~/unitree_lab.
+    rl_lab_root = Path(__file__).resolve().parents[2]
     script = rl_lab_root / "scripts" / "mujoco_eval" / "run_sim2sim_locomotion.py"
 
     xml_dir = rl_lab_root / "source" / "unitree_lab" / "unitree_lab" / "assets" / "robots_xml" / "g1"
@@ -265,9 +266,13 @@ def _log_sim2sim_video_to_wandb(mp4_path: str, iteration: int) -> None:
         return
     if not os.path.isfile(mp4_path):
         return
-    cur_step = max(int(getattr(wandb.run, "step", 0) or 0), iteration)
-    wandb.log({"sim2sim_video": wandb.Video(mp4_path, format="mp4")}, step=cur_step, commit=True)
-    wandb.save(mp4_path, base_path=os.path.dirname(mp4_path), policy="now")
+    step = int(iteration) if iteration is not None else None
+    caption = f"iter_{iteration}" if iteration is not None else "sim2sim"
+    wandb.log(
+        {"sim2sim_video": wandb.Video(mp4_path, format="mp4", caption=caption)},
+        step=step,
+        commit=False,
+    )
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -355,8 +360,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create runner from rsl-rl
     agent_dict = agent_cfg.to_dict()
 
-    if agent_cfg.class_name == "AMPRunner":
-        runner = AMPRunner(env, agent_dict, log_dir=log_dir, device=agent_cfg.device)
+    if agent_cfg.class_name == "AMPPluginRunner":
+        runner = AMPPluginRunner(env, agent_dict, log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_dict, log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":

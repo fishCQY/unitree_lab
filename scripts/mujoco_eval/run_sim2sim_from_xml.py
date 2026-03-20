@@ -63,12 +63,16 @@ def main() -> None:
     if not xml.exists():
         raise FileNotFoundError(f"XML not found: {xml}")
 
-    # Load eval task ONLY for default command settings (we will disable injection)
     from unitree_lab.mujoco_utils.evaluation.eval_task import get_eval_task
-    from simulator import _deploy_yaml_to_config_override, _load_deploy_yaml, run_locomotion_simulation
+    from run_sim2sim_locomotion import (
+        _deploy_yaml_to_config_override,
+        _load_deploy_yaml,
+        run_interactive,
+        run_headless,
+    )
 
     task = get_eval_task(args.task)
-    # IMPORTANT: do not inject terrain; use XML terrain as-is.
+    # Do not inject terrain; use XML terrain as-is.
     task.terrain_type = "flat"
 
     override = {}
@@ -77,25 +81,35 @@ def main() -> None:
     if args.config_override:
         override.update(json.loads(args.config_override))
 
-    velocity = tuple(args.velocity) if args.velocity else None
-    is_interactive = bool(args.render)
+    from unitree_lab.mujoco_utils.simulation.base_simulator import BaseMujocoSimulator
 
-    run_locomotion_simulation(
-        onnx_path=str(onnx),
+    simulator = BaseMujocoSimulator(
         xml_path=str(xml),
-        eval_task=task,
-        render=is_interactive,
-        follow=bool(args.follow),
-        teleop=str(args.teleop),
-        velocity=velocity,
-        deploy_yaml=str(args.deploy_yaml) if args.deploy_yaml else None,
+        onnx_path=str(onnx),
         config_override=override if override else None,
-        max_steps=int(args.max_steps),
-        num_episodes=1,
-        save_video=False,
-        output_dir="eval_results",
-        video_steps=int(args.max_steps),
     )
+
+    velocity = tuple(args.velocity) if args.velocity else None
+
+    if args.render:
+        run_interactive(
+            simulator=simulator,
+            task=task,
+            teleop=args.teleop,
+            follow=args.follow,
+            velocity=velocity,
+            max_steps_per_episode=args.max_steps,
+        )
+    else:
+        run_headless(
+            simulator=simulator,
+            task=task,
+            num_episodes=1,
+            save_video=False,
+            output_dir="eval_results",
+            video_steps=args.max_steps,
+            velocity=velocity,
+        )
 
 
 if __name__ == "__main__":

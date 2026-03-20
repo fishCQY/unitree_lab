@@ -396,150 +396,89 @@ def depth_scan(
 
 
 # =============================================================================
-# AMP discriminator observation terms
+# AMP Plugin observation terms (single-step, for use with AMPPlugin)
 # =============================================================================
 
 
-class AMPAgentObsTerm(ManagerTermBase):
-    """Agent proprioceptive observation for AMP discriminator.
+def amp_joint_pos(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Joint positions for AMP observation."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.joint_pos[:, asset_cfg.joint_ids] if asset_cfg.joint_ids is not None else asset.data.joint_pos
 
-    Returns a 3D tensor (num_envs, disc_obs_steps, obs_dim) containing the
-    last N steps of [ang_vel, proj_grav, joint_pos_rel, joint_vel].
-    On environment reset, the history buffer is filled with the current frame.
+
+def amp_joint_vel(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Joint velocities for AMP observation."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.joint_vel[:, asset_cfg.joint_ids] if asset_cfg.joint_ids is not None else asset.data.joint_vel
+
+
+def amp_base_ang_vel(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Base angular velocity in body frame for AMP observation."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.root_link_ang_vel_b
+
+
+def amp_projected_gravity(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Projected gravity vector in body frame for AMP observation."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    grav_w = torch.tensor([0.0, 0.0, -1.0], device=env.device).expand(env.num_envs, -1)
+    return math_utils.quat_apply_inverse(asset.data.root_link_quat_w, grav_w)
+
+
+def amp_body_pos_b(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Key body positions in body frame for AMP observation.
+
+    Computes positions of selected bodies relative to root, expressed in
+    the body (root) frame. This provides task-space features that complement
+    the joint-space features (dof_pos, dof_vel).
+
+    Configure ``asset_cfg.body_ids`` to select which bodies to track
+    (e.g., knees and elbows).
+
+    Returns:
+        Tensor of shape (num_envs, num_bodies * 3).
     """
-
-    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
-        super().__init__(cfg, env)
-        self.asset: Articulation = env.scene[cfg.params["asset_cfg"].name]
-        self.disc_obs_steps: int = cfg.params.get("disc_obs_steps", 2)
-        num_joints = self.asset.num_joints
-        self.obs_dim = 3 + 3 + num_joints + num_joints
-        self._history = torch.zeros(
-            env.num_envs, self.disc_obs_steps, self.obs_dim,
-            device=env.device, dtype=torch.float32,
-        )
-        self._initialized = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
-
-    def _get_features(self, env: ManagerBasedEnv) -> torch.Tensor:
-        """Compute [ang_vel(3), proj_grav(3), dof_pos_rel(N), dof_vel(N)]."""
-        ang_vel = self.asset.data.root_link_ang_vel_b
-        grav_w = torch.tensor([0.0, 0.0, -1.0], device=env.device).expand(env.num_envs, -1)
-        proj_grav = math_utils.quat_apply_inverse(self.asset.data.root_link_quat_w, grav_w)
-        dof_pos_rel = self.asset.data.joint_pos - self.asset.data.default_joint_pos
-        dof_vel = self.asset.data.joint_vel
-        return torch.cat([ang_vel, proj_grav, dof_pos_rel, dof_vel], dim=-1)
-
-    def __call__(
-        self,
-        env: ManagerBasedEnv,
-        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-        disc_obs_steps: int = 2,
-    ) -> torch.Tensor:
-        features = self._get_features(env)
-        reset_mask = env.episode_length_buf == 0
-        needs_init = reset_mask | ~self._initialized
-        if needs_init.any():
-            self._history[needs_init] = features[needs_init].unsqueeze(1).expand(-1, self.disc_obs_steps, -1)
-            self._initialized[needs_init] = True
-        non_reset = ~needs_init
-        if non_reset.any():
-            self._history[non_reset] = torch.roll(self._history[non_reset], -1, dims=1)
-            self._history[non_reset, -1] = features[non_reset]
-        return self._history.clone()
+    asset: Articulation = env.scene[asset_cfg.name]
+    body_ids = asset_cfg.body_ids
+    relative_pos = asset.data.body_pos_w[:, body_ids] - asset.data.root_pos_w[:, None, :]
+    num_bodies = relative_pos.shape[1]
+    root_quat = asset.data.root_link_quat_w[:, None, :].expand(-1, num_bodies, -1)
+    pos_b = math_utils.quat_apply_inverse(root_quat, relative_pos)
+    return pos_b.reshape(env.num_envs, -1)
 
 
-class AMPDemoObsTerm(ManagerTermBase):
-    """Demonstration motion observation for AMP discriminator.
+def vel_cmd_condition_id(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    vx_index: int = 0,
+    vx_threshold: float = 1.1,
+) -> torch.Tensor:
+    """Velocity command condition ID for conditional AMP.
 
-    Loads motion pkl files at initialization and samples random consecutive
-    frames each step. Returns (num_envs, disc_obs_steps, obs_dim).
+    Maps the current velocity command to a discrete condition ID:
+      - 0 (walk) if |vx| <= vx_threshold
+      - 1 (run)  if |vx| > vx_threshold
 
-    The pkl files must contain: 'dof_pos', 'root_rot', 'fps', and optionally
-    precomputed 'dof_pos_rel', 'dof_vel', 'root_angle_vel', 'proj_grav'.
+    Returns:
+        Tensor of shape (num_envs, 1) with integer condition IDs.
     """
+    vx = env.command_manager.get_command(command_name)[:, vx_index]
+    cond_id = (vx.abs() > vx_threshold).long()
+    return cond_id.unsqueeze(-1)
 
-    def __init__(self, cfg: ObservationTermCfg, env: ManagerBasedEnv):
-        super().__init__(cfg, env)
-        self.disc_obs_steps: int = cfg.params.get("disc_obs_steps", 2)
-        motion_files: list[str] = cfg.params["motion_files"]
-        default_dof_pos = cfg.params.get("default_dof_pos", None)
 
-        all_features, lengths = self._load_all(motion_files, default_dof_pos, env.device)
-        self._demo_data = all_features
-        self._demo_lengths = lengths
-
-        self._demo_pairs = self._build_consecutive_pairs()
-        self._num_envs = env.num_envs
-
-    @staticmethod
-    def _resolve_path(p: str | Path) -> Path:
-        """Resolve motion file path — try absolute, then relative to workspace root."""
-        p = Path(p)
-        if p.is_absolute() and p.exists():
-            return p
-        # Workspace root: up from .../tasks/locomotion/mdp/observations.py
-        ws_root = Path(__file__).resolve().parents[6]
-        candidate = ws_root / p
-        if candidate.exists():
-            return candidate
-        return p
-
-    def _load_all(self, paths: list[str], default_dof_pos, device) -> tuple[torch.Tensor, list[int]]:
-        all_feats = []
-        lengths = []
-        for raw_p in paths:
-            p = self._resolve_path(raw_p)
-            if not p.exists():
-                print(f"[AMPDemoObs] Warning: motion file not found, skipping: {raw_p}")
-                continue
-            with open(p, "rb") as f:
-                motion = pickle.load(f)
-            feats = self._extract_features(motion, default_dof_pos)
-            all_feats.append(feats)
-            lengths.append(feats.shape[0])
-        if not all_feats:
-            raise FileNotFoundError("No valid motion data files found for AMP demo observations")
-        return torch.cat(all_feats, dim=0).to(device), lengths
-
-    @staticmethod
-    def _extract_features(motion: dict, default_dof_pos) -> torch.Tensor:
-        """Extract [ang_vel, proj_grav, dof_pos_rel, dof_vel] from motion dict.
-
-        Expects preprocessed pkl files (from preprocess_amp_motion.py).
-        """
-        required = ("root_angle_vel", "proj_grav", "dof_pos_rel", "dof_vel")
-        missing = [k for k in required if k not in motion]
-        if missing:
-            raise KeyError(
-                f"Motion pkl is missing precomputed fields {missing}. "
-                "Run scripts/preprocess_amp_motion.py on the data first."
-            )
-        ang_vel = np.asarray(motion["root_angle_vel"], dtype=np.float32)
-        proj_grav = np.asarray(motion["proj_grav"], dtype=np.float32)
-        dof_pos_rel = np.asarray(motion["dof_pos_rel"], dtype=np.float32)
-        dof_vel = np.asarray(motion["dof_vel"], dtype=np.float32)
-        return torch.from_numpy(np.concatenate([ang_vel, proj_grav, dof_pos_rel, dof_vel], axis=-1))
-
-    def _build_consecutive_pairs(self) -> torch.Tensor:
-        pairs = []
-        offset = 0
-        for length in self._demo_lengths:
-            if length < self.disc_obs_steps:
-                offset += length
-                continue
-            clip = self._demo_data[offset:offset + length]
-            for t in range(length - self.disc_obs_steps + 1):
-                pairs.append(clip[t:t + self.disc_obs_steps])
-            offset += length
-        if not pairs:
-            raise ValueError("No valid demo pairs could be built")
-        return torch.stack(pairs)
-
-    def __call__(
-        self,
-        env: ManagerBasedEnv,
-        disc_obs_steps: int = 2,
-        motion_files: list[str] | None = None,
-    ) -> torch.Tensor:
-        idx = torch.randint(0, self._demo_pairs.shape[0], (self._num_envs,), device=self._demo_pairs.device)
-        return self._demo_pairs[idx]

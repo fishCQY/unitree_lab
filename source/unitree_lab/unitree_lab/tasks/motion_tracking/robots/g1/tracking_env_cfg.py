@@ -156,12 +156,14 @@ class G1TrackingEventCfg(BaseTrackingEventCfg):
 
 @configclass
 class G1TrackingRewardsCfg(BaseTrackingRewardsCfg):
-    tracking_body_lin_vel = RewTerm(func=mdp.tracking_body_vel_exp, weight=0.5, params={"asset_cfg": SceneEntityCfg("robot", body_names=G1_TRACKING_BODIES), "command_name": "motion_tracking", "std": math.sqrt(0.25)})
-    tracking_body_ang_vel = RewTerm(func=mdp.tracking_body_ang_vel_exp, weight=0.5, params={"asset_cfg": SceneEntityCfg("robot", body_names=["pelvis"]), "command_name": "motion_tracking", "std": math.sqrt(0.5)})
-    tracking_key_points_w_exp = RewTerm(func=mdp.tracking_key_points_w_exp, weight=1.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=["pelvis"]), "command_name": "motion_tracking", "std": math.sqrt(0.01)})
-    tracking_key_points_exp = RewTerm(func=mdp.tracking_key_points_exp, weight=1.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=["torso_link", ".*_knee_link", ".*_ankle_roll_link", ".*_elbow_link", ".*_wrist_yaw_link"]), "command_name": "motion_tracking", "std": math.sqrt(0.01)})
-    torso_contacts = RewTerm(func=mdp.select_undesired_contacts, weight=-1.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="torso_link"), "threshold": 1.0, "command_name": "motion_tracking", "height_threshold": 0.6})
-    feet_height_l2 = RewTerm(func=mdp.tracking_body_height_l2, weight=-10.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll.*"]), "command_name": "motion_tracking"})
+    # --- Core tracking rewards (aligned with bfm_training DeepMimic) ---
+    tracking_body_lin_vel = RewTerm(func=mdp.tracking_body_vel_exp, weight=4.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=G1_TRACKING_BODIES), "command_name": "motion_tracking", "std": math.sqrt(0.25)})
+    tracking_body_ang_vel = RewTerm(func=mdp.tracking_body_ang_vel_exp, weight=1.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=["pelvis"]), "command_name": "motion_tracking", "std": math.sqrt(1.0 / 12.0)})
+    tracking_key_points_w_exp = RewTerm(func=mdp.tracking_key_points_w_exp, weight=4.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=["pelvis"]), "command_name": "motion_tracking", "std": math.sqrt(1.0 / 8.0)})
+    tracking_key_points_exp = RewTerm(func=mdp.tracking_key_points_exp, weight=3.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=["torso_link", ".*_knee_link", ".*_ankle_roll_link", ".*_elbow_link", ".*_wrist_yaw_link"]), "command_name": "motion_tracking", "std": math.sqrt(1.0 / 8.0)})
+    # --- Retained but disabled (weight=0) ---
+    torso_contacts = RewTerm(func=mdp.select_undesired_contacts, weight=0.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="torso_link"), "threshold": 1.0, "command_name": "motion_tracking", "height_threshold": 0.6})
+    feet_height_l2 = RewTerm(func=mdp.tracking_body_height_l2, weight=0.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll.*"]), "command_name": "motion_tracking"})
 
 
 # =============================================================================

@@ -35,18 +35,24 @@ from unitree_lab.terrain import ROUGH_TERRAINS_CFG
 from unitree_lab.sensors.ray_caster import NoiseRayCasterCameraCfg
 from unitree_lab.sensors.imu import DelayedImuCfg
 
-# AMP demonstration motions:
-# Use LAFAN locomotion subset (walk/run/sprint) for discriminator demos.
-_AMP_ROOT_DIR = Path(__file__).resolve().parents[4] / "data" / "MotionData" / "g1_29dof" / "amp"
-_AMP_LAFAN_DIR = _AMP_ROOT_DIR / "lafan"
+# AMP demonstration data directory (LAFAN locomotion subset retargeted to G1 29dof).
+_AMP_DATA_DIR = Path(__file__).resolve().parents[4] / "data" / "AMP"
 
-_LOCOMOTION_PREFIXES = ("walk", "run", "sprint")
-_AMP_MOTION_FILES = []
-if _AMP_LAFAN_DIR.exists():
-    _AMP_MOTION_FILES = sorted(
-        f for f in _AMP_LAFAN_DIR.glob("*.pkl")
-        if any(f.stem.startswith(p) for p in _LOCOMOTION_PREFIXES)
-    )
+# G1 29dof left-right symmetric joint pairs for mirror augmentation.
+_G1_LEFT_JOINTS = [
+    "left_hip_yaw_joint", "left_hip_roll_joint", "left_hip_pitch_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint", "left_elbow_joint",
+    "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+]
+_G1_RIGHT_JOINTS = [
+    "right_hip_yaw_joint", "right_hip_roll_joint", "right_hip_pitch_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint", "right_elbow_joint",
+    "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+]
 
 
 # =============================================================================
@@ -234,13 +240,29 @@ class G1ObservationsCfg:
             self.concatenate_terms = True
 
     @configclass
-    class DiscriminatorCfg(ObsGroup):
-        """Agent proprioceptive features for AMP discriminator (3D output)."""
-        amp_agent_obs = ObsTerm(
-            func=mdp.AMPAgentObsTerm,
+    class AmpCfg(ObsGroup):
+        """Single-step AMP features for AMPPlugin (2D output).
+
+        Used with the plugin-based AMP runner. Each term outputs a
+        standard (num_envs, dim) tensor; the AMPPlugin constructs
+        multi-frame sequences internally from the rollout storage.
+        """
+        joint_pos = ObsTerm(func=mdp.amp_joint_pos, params={"asset_cfg": SceneEntityCfg("robot")})
+        joint_vel = ObsTerm(func=mdp.amp_joint_vel, params={"asset_cfg": SceneEntityCfg("robot")})
+        base_ang_vel = ObsTerm(func=mdp.amp_base_ang_vel, params={"asset_cfg": SceneEntityCfg("robot")})
+        projected_gravity = ObsTerm(func=mdp.amp_projected_gravity, params={"asset_cfg": SceneEntityCfg("robot")})
+        body_pos_b = ObsTerm(
+            func=mdp.amp_body_pos_b,
             params={
-                "asset_cfg": SceneEntityCfg("robot"),
-                "disc_obs_steps": 2,
+                "asset_cfg": SceneEntityCfg(
+                    "robot",
+                    body_names=[
+                        "left_knee_link",
+                        "right_knee_link",
+                        "left_shoulder_roll_link",
+                        "right_shoulder_roll_link",
+                    ],
+                ),
             },
         )
 
@@ -249,13 +271,14 @@ class G1ObservationsCfg:
             self.concatenate_terms = True
 
     @configclass
-    class DiscriminatorDemoCfg(ObsGroup):
-        """Demo motion features for AMP discriminator (3D output)."""
-        amp_demo_obs = ObsTerm(
-            func=mdp.AMPDemoObsTerm,
+    class AmpConditionCfg(ObsGroup):
+        """Condition ID for conditional AMP (integer label)."""
+        vel_cmd_condition = ObsTerm(
+            func=mdp.vel_cmd_condition_id,
             params={
-                "disc_obs_steps": 2,
-                "motion_files": [str(p) for p in _AMP_MOTION_FILES],
+                "command_name": "base_velocity",
+                "vx_index": 0,
+                "vx_threshold": 1.1,
             },
         )
 
@@ -268,46 +291,50 @@ class G1ObservationsCfg:
     guidance: PolicyCfg = PolicyCfg()
     debug: DebugCfg = DebugCfg()
     image: ImageCfg = ImageCfg()
-    disc_agent: DiscriminatorCfg = DiscriminatorCfg()
-    disc_demo: DiscriminatorDemoCfg = DiscriminatorDemoCfg()
+    amp: AmpCfg = AmpCfg()
+    amp_condition: AmpConditionCfg = AmpConditionCfg()
 
 
 @configclass
 class G1EventCfg:
-    physics_material = EventTerm(func=mdp.randomize_rigid_body_material, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names=".*"), "static_friction_range": (0.6, 1.0), "dynamic_friction_range": (0.4, 0.8), "restitution_range": (0.0, 1.0), "num_buckets": 64})
-    add_base_mass = EventTerm(func=mdp.randomize_rigid_body_mass, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "mass_distribution_params": (-5.0, 5.0), "operation": "add"})
-    scale_link_mass = EventTerm(func=mdp.randomize_rigid_body_mass, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names=["(?!.*torso.*).*"]), "mass_distribution_params": (0.8, 1.2), "operation": "scale"})
-    randomize_rigid_body_com = EventTerm(func=mdp.randomize_rigid_body_com, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.05, 0.05)}})
+    physics_material = EventTerm(func=mdp.randomize_rigid_body_material, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names=".*"), "static_friction_range": (0.2, 1.3), "dynamic_friction_range": (0.2, 1.3), "restitution_range": (0.0, 0.8), "num_buckets": 64})
+    add_base_mass = EventTerm(func=mdp.randomize_rigid_body_mass, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "mass_distribution_params": (1.0, 1.2), "operation": "scale"})
+    scale_link_mass = EventTerm(func=mdp.randomize_rigid_body_mass, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names=["(?!.*torso.*).*"]), "mass_distribution_params": (0.85, 1.15), "operation": "scale"})
+    randomize_rigid_body_com = EventTerm(func=mdp.randomize_rigid_body_com, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "com_range": {"x": (-0.025, 0.025), "y": (-0.025, 0.025), "z": (-0.025, 0.025)}})
     scale_actuator_gains = EventTerm(func=mdp.randomize_actuator_gains, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint"), "stiffness_distribution_params": (0.8, 1.2), "damping_distribution_params": (0.8, 1.2), "operation": "scale"})
-    scale_joint_armature = EventTerm(func=mdp.randomize_joint_parameters, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint"), "armature_distribution_params": (0.8, 1.2), "operation": "scale"})
+    scale_joint_armature = EventTerm(func=mdp.randomize_joint_parameters, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint"), "armature_distribution_params": (0.75, 1.25), "operation": "scale"})
     reset_base = EventTerm(func=mdp.reset_root_state_uniform, mode="reset", params={"pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)}, "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "z": (-0.5, 0.5), "roll": (-0.5, 0.5), "pitch": (-0.5, 0.5), "yaw": (-0.5, 0.5)}})
     reset_robot_joints = EventTerm(func=mdp.reset_joints_by_scale, mode="reset", params={"position_range": (0.5, 1.5), "velocity_range": (0.0, 0.0)})
-    base_external_force_torque = EventTerm(func=mdp.apply_external_force_torque_stochastic, mode="interval", interval_range_s=(0.0, 0.0), params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "force_range": {"x": (-1000.0, 1000.0), "y": (-1000.0, 1000.0), "z": (-500.0, 500.0)}, "torque_range": {"x": (-0.0, 0.0), "y": (-0.0, 0.0), "z": (-0.0, 0.0)}, "probability": 0.002})
+    base_external_force_torque = EventTerm(func=mdp.apply_external_force_torque_stochastic, mode="interval", interval_range_s=(3.7, 4.2), params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "force_range": {"x": (-200.0, 200.0), "y": (-200.0, 200.0), "z": (-100.0, 100.0)}, "torque_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)}, "probability": 1.0})
 
 
 @configclass
 class G1RewardsCfg:
-    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=3.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
-    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_world_exp, weight=1.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
-    lin_vel_z_l2 = RewTerm(func=mdp.body_lin_vel_z_l2, weight=-0.25, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
-    ang_vel_xy_l2 = RewTerm(func=mdp.body_ang_vel_xy_l2, weight=-0.05, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
-    energy = RewTerm(func=mdp.energy, weight=-1e-3)
-    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-0.5e-7)
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
-    undesired_contacts = RewTerm(func=mdp.undesired_contacts, weight=-1.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="(?!.*ankle.*).*"), "threshold": 1.0})
-    fly = RewTerm(func=mdp.fly, weight=-1.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "threshold": 1.0})
-    body_orientation_l2 = RewTerm(func=mdp.body_orientation_l2, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")}, weight=-2.0)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-1.0)
-    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
-    feet_air_time = RewTerm(func=mdp.feet_air_time_positive_biped, weight=0.15, params={"command_name": "base_velocity", "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "threshold": 0.25})
-    feet_slide = RewTerm(func=mdp.feet_slide, weight=-0.25, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll.*")})
-    feet_force = RewTerm(func=mdp.body_force, weight=-3e-3, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "threshold": 500, "max_reward": 400})
-    feet_too_near = RewTerm(func=mdp.feet_too_near_humanoid, weight=-2.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=[".*ankle_roll.*"]), "threshold": 0.2})
-    feet_stumble = RewTerm(func=mdp.feet_stumble, weight=-2.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*ankle_roll.*"])})
-    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-2.0)
-    joint_deviation_hip = RewTerm(func=mdp.joint_deviation_l1, weight=-0.15, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_yaw.*", ".*_hip_roll.*", ".*_shoulder_pitch.*", ".*_elbow.*"])})
-    joint_deviation_arms = RewTerm(func=mdp.joint_deviation_l1, weight=-0.2, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*waist.*", ".*_shoulder_roll.*", ".*_shoulder_yaw.*", ".*_wrist.*"])})
-    joint_deviation_legs = RewTerm(func=mdp.joint_deviation_l1, weight=-0.02, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_pitch.*", ".*_knee.*", ".*_ankle.*"])})
+    # --- Core tracking rewards (aligned with bfm_training) ---
+    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=2.5, params={"command_name": "base_velocity", "std": math.sqrt(0.15)})
+    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_world_exp, weight=1.5, params={"command_name": "base_velocity", "std": math.sqrt(0.5)})
+    # --- Core penalties (aligned with bfm_training) ---
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.1)
+    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-1.0)
+    undesired_contacts = RewTerm(func=mdp.undesired_contacts, weight=-2.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="(?!.*ankle.*).*"), "threshold": 1.0})
+    # --- Regularization rewards (cooperate with AMP style reward) ---
+    feet_air_time = RewTerm(func=mdp.feet_air_time_positive_biped, weight=0.3, params={"command_name": "base_velocity", "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "threshold": 0.25})
+    feet_slide = RewTerm(func=mdp.feet_slide, weight=-0.1, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll.*")})
+    joint_deviation_hip = RewTerm(func=mdp.joint_deviation_l1, weight=-0.1, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_yaw.*", ".*_hip_roll.*", ".*_shoulder_pitch.*", ".*_elbow.*"])})
+    joint_deviation_arms = RewTerm(func=mdp.joint_deviation_l1, weight=-0.1, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*waist.*", ".*_shoulder_roll.*", ".*_shoulder_yaw.*", ".*_wrist.*"])})
+    joint_deviation_legs = RewTerm(func=mdp.joint_deviation_l1, weight=-0.05, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_pitch.*", ".*_knee.*", ".*_ankle.*"])})
+    # --- Retained but disabled ---
+    lin_vel_z_l2 = RewTerm(func=mdp.body_lin_vel_z_l2, weight=0.0, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
+    ang_vel_xy_l2 = RewTerm(func=mdp.body_ang_vel_xy_l2, weight=0.0, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
+    energy = RewTerm(func=mdp.energy, weight=0.0)
+    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=0.0)
+    fly = RewTerm(func=mdp.fly, weight=0.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "threshold": 1.0})
+    body_orientation_l2 = RewTerm(func=mdp.body_orientation_l2, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")}, weight=0.0)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=0.0)
+    termination_penalty = RewTerm(func=mdp.is_terminated, weight=0.0)
+    feet_force = RewTerm(func=mdp.body_force, weight=0.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "threshold": 500, "max_reward": 400})
+    feet_too_near = RewTerm(func=mdp.feet_too_near_humanoid, weight=0.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=[".*ankle_roll.*"]), "threshold": 0.2})
+    feet_stumble = RewTerm(func=mdp.feet_stumble, weight=0.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*ankle_roll.*"])})
 
 
 @configclass
@@ -348,24 +375,57 @@ class UnitreeG1RoughEnvCfg(LocomotionEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = UNITREE_G1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        self.episode_length_s = 10.0
         self.actions.joint_pos.scale = 0.25
         self.actions.joint_pos.clip = {".*": [-100.0, 100]}
         self.observations.policy.height_scan = None
-        self.rewards.feet_air_time.weight = 0.4
-        self.rewards.track_lin_vel_xy_exp.weight = 1.0
-        self.rewards.track_ang_vel_z_exp.weight = 1.0
-        self.rewards.lin_vel_z_l2.weight = -1.0
-        # AMP-specific: let discriminator handle style
-        self.rewards.joint_deviation_arms.weight = 0.0
-        self.rewards.joint_deviation_hip.weight = 0.0
-        self.rewards.joint_deviation_legs.weight = 0.0
-        self.rewards.flat_orientation_l2.weight = 0.0
-        self.rewards.body_orientation_l2.weight = -1.0
-        self.rewards.fly.weight = 0.0
-        self.rewards.feet_force.weight = 0.0
-        # Disable depth-camera observation groups to save VRAM
+        self.commands.base_velocity.ranges.ang_vel_z = (-2.0, 2.0)
+        self.commands.base_velocity.resampling_time_range = (4.0, 6.0)
+        self.commands.base_velocity.rel_standing_envs = 0.1
         self.observations.debug = None
         self.observations.image = None
+
+    def load_amp_data(self):
+        """Load conditional LAFAN AMP data for the AMPPlugin discriminator.
+
+        Returns walk/run condition labels matching the AmpConditionCfg
+        (vx_threshold=1.1 → condition 0=walk, 1=run).
+        """
+        from unitree_lab.utils.amp_data_loader import (
+            load_conditional_amp_data,
+            create_mirror_config,
+        )
+
+        all_joint_names = [
+            "left_hip_yaw_joint", "left_hip_roll_joint", "left_hip_pitch_joint",
+            "left_knee_joint", "right_hip_yaw_joint", "right_hip_roll_joint",
+            "right_hip_pitch_joint", "right_knee_joint",
+            "waist_yaw_joint", "waist_roll_joint", "torso_joint",
+            "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+            "left_shoulder_yaw_joint", "left_elbow_joint",
+            "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+            "right_shoulder_yaw_joint", "right_elbow_joint",
+            "left_ankle_pitch_joint", "left_ankle_roll_joint",
+            "right_ankle_pitch_joint", "right_ankle_roll_joint",
+            "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+            "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+        ]
+        mirror_indices, mirror_signs = create_mirror_config(
+            _G1_LEFT_JOINTS, _G1_RIGHT_JOINTS, all_joint_names,
+        )
+
+        amp_conditions = {
+            "walk": [str(_AMP_DATA_DIR / "lafan_walk_clips.pkl")],
+            "run": [str(_AMP_DATA_DIR / "lafan_run_clips.pkl")],
+        }
+        return load_conditional_amp_data(
+            amp_conditions,
+            keys=["dof_pos", "dof_vel", "root_angle_vel", "proj_grav"],
+            device=self.sim.device,
+            mirror=True,
+            joint_mirror_indices=mirror_indices,
+            joint_mirror_signs=mirror_signs,
+        )
 
 
 @configclass

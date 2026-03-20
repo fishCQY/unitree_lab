@@ -1,16 +1,43 @@
-# 基本训练 + wandb 日志
-# python scripts/rsl_rl/train.py \
-#   --task unitree_lab-Isaac-Velocity-Rough-Unitree-G1-AMP-v0 \
-#   --headless --logger wandb --log_project_name unitree_g1
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 训练 + wandb + 每次保存 checkpoint 都跑 5 秒 sim2sim
+# =========================================================================
+# G1 AMP Locomotion Training
+# =========================================================================
+#
+# Environment:  UnitreeG1RoughEnvCfg  (rough terrain + LAFAN AMP)
+# Algorithm:    AMPPluginRunner       (PPO + AMP discriminator plugin)
+# AMP data:     data/AMP/lafan_walk_clips.pkl, lafan_run_clips.pkl
+#
+# Variants:
+#   TASK=unitree_lab-Isaac-Velocity-Rough-Unitree-G1-AMP-v0       (rough, MLP)
+#   TASK=unitree_lab-Isaac-Velocity-Rough-Unitree-G1-AMP-GRU-v0   (rough, GRU)
+#   TASK=unitree_lab-Isaac-Velocity-Flat-Unitree-G1-AMP-v0        (flat,  MLP)
+# =========================================================================
+
+TASK="${TASK:-unitree_lab-Isaac-Velocity-Rough-Unitree-G1-AMP-v0}"
+
+# Basic training + wandb logging + sim2sim video upload
 python scripts/rsl_rl/train.py \
-  --task unitree_lab-Isaac-Velocity-Rough-Unitree-G1-AMP-v0 \
+  --task "${TASK}" \
   --headless --logger wandb --log_project_name unitree_g1 \
   --sim2sim --sim2sim_duration 20.0
 
-# 每 2 次 checkpoint 才跑一次 sim2sim（节省资源）
+# --- Alternative commands (uncomment as needed) ---
+
+# Training without sim2sim:
 # python scripts/rsl_rl/train.py \
-#   --task unitree_lab-Isaac-Velocity-Rough-Unitree-G1-AMP-v0 \
+#   --task "${TASK}" \
+#   --headless --logger wandb --log_project_name unitree_g1
+
+# Sim2sim every 2 checkpoints (save resources):
+# python scripts/rsl_rl/train.py \
+#   --task "${TASK}" \
 #   --headless --logger wandb --log_project_name unitree_g1 \
 #   --sim2sim --sim2sim_every 2
+
+# Flat terrain:
+# TASK=unitree_lab-Isaac-Velocity-Flat-Unitree-G1-AMP-v0 bash train.sh
+
+# GRU policy:
+# TASK=unitree_lab-Isaac-Velocity-Rough-Unitree-G1-AMP-GRU-v0 bash train.sh
