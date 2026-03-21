@@ -22,7 +22,7 @@ Usage:
 
     # During rollout:
     style_reward, disc_score = amp.reward(obs, storage, step_dt)
-    total_reward = amp.lerp_reward(task_reward, style_reward)
+    total_reward = amp.combine_reward(task_reward, style_reward)
 
     # After PPO update:
     amp_loss_dict = amp.update(storage, rl_learning_rate)
@@ -81,8 +81,7 @@ class AMPPlugin:
         self.obs_group: str = cfg["obs_group"]
         self.condition_obs_group: str | None = cfg.get("condition_obs_group")
         self.num_frames: int = cfg.get("num_frames", 2)
-        self.style_reward_scale: float = cfg.get("style_reward_scale", 1.0)
-        self.task_style_lerp: float = cfg.get("task_style_lerp", 0.5)
+        self.style_reward_scale: float = cfg.get("style_reward_scale", 2.0)
         self.grad_penalty_scale: float = cfg.get("grad_penalty_scale", 10.0)
         self.max_grad_norm: float = cfg.get("disc_max_grad_norm", 0.5)
         self.noise_scale: float | None = cfg.get("noise_scale")
@@ -200,6 +199,10 @@ class AMPPlugin:
             )
             self._offline_cond_ids = cond_seqs[:, -1, 0].long()  # (M,)
 
+        self._cond_index_map = None
+        if self._offline_cond_ids is not None:
+            self._rebuild_cond_index_map(self._offline_cond_ids)
+
         print(f"[AMPPlugin] Offline: {len(data)} frames → {len(seqs)} valid sequences")
 
     # ------------------------------------------------------------------
@@ -274,9 +277,12 @@ class AMPPlugin:
 
         return style_reward, disc_score
 
-    def lerp_reward(self, task_reward: torch.Tensor, style_reward: torch.Tensor) -> torch.Tensor:
-        """Linearly interpolate between task reward and style reward."""
-        return self.task_style_lerp * task_reward + (1.0 - self.task_style_lerp) * style_reward
+    def combine_reward(self, task_reward: torch.Tensor, style_reward: torch.Tensor) -> torch.Tensor:
+        """Combine task and style rewards additively (bfm_training style).
+
+        style_reward already includes step_dt * style_reward_scale from reward().
+        """
+        return task_reward + style_reward
 
     # ------------------------------------------------------------------
     # Discriminator update (called after PPO update)
@@ -585,15 +591,35 @@ class AMPPlugin:
         offline_conds: torch.Tensor,
         batch_size: int,
     ) -> torch.Tensor:
-        """For conditional AMP: sample offline indices matching target conditions."""
+        """For conditional AMP: sample offline indices matching target conditions (vectorized)."""
+        if not hasattr(self, "_cond_index_map") or self._cond_index_map is None:
+            self._rebuild_cond_index_map(offline_conds)
+
         indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-        for i in range(batch_size):
-            cond = target_conds[i]
-            pool = torch.nonzero(offline_conds == cond, as_tuple=False).squeeze(-1)
-            if pool.numel() == 0:
-                pool = torch.arange(len(offline_conds), device=self.device)
-            indices[i] = pool[torch.randint(pool.numel(), (1,), device=self.device)]
+        matched = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+
+        for cond_val, pool in self._cond_index_map.items():
+            mask = target_conds == cond_val
+            count = mask.sum().item()
+            if count == 0:
+                continue
+            indices[mask] = pool[torch.randint(pool.numel(), (count,), device=self.device)]
+            matched |= mask
+
+        if not matched.all():
+            fallback = torch.arange(len(offline_conds), device=self.device)
+            n = (~matched).sum().item()
+            indices[~matched] = fallback[torch.randint(fallback.numel(), (n,), device=self.device)]
+
         return indices
+
+    def _rebuild_cond_index_map(self, offline_conds: torch.Tensor) -> None:
+        """Pre-build per-condition index pools for fast vectorized sampling."""
+        self._cond_index_map = {}
+        for cond_val in offline_conds.unique().tolist():
+            self._cond_index_map[cond_val] = torch.nonzero(
+                offline_conds == cond_val, as_tuple=False
+            ).squeeze(-1)
 
     # ------------------------------------------------------------------
     # Multi-GPU

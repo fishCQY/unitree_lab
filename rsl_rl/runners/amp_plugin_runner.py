@@ -151,7 +151,7 @@ class AMPPluginRunner(OnPolicyRunner):
                     # AMP reward (reward() uses no_grad internally)
                     if self.amp is not None:
                         style_rewards, disc_score = self.amp.reward(obs, self.alg.storage, self._step_dt)
-                        total_rewards = self.amp.lerp_reward(task_reward=rewards, style_reward=style_rewards)
+                        total_rewards = self.amp.combine_reward(task_reward=rewards, style_reward=style_rewards)
                     else:
                         style_rewards = None
                         total_rewards = rewards

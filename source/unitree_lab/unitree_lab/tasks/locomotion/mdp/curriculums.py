@@ -38,31 +38,15 @@ def terrain_levels_vel(
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
     terrain: TerrainImporter = env.scene.terrain
-    reward: RewardManager = env.reward_manager
-    lin_track_reward_sum = (
-        reward._episode_sums["track_lin_vel_xy_exp"][env_ids] / env.max_episode_length_s
-    )
-    lin_track_reward_idx = reward._term_names.index("track_lin_vel_xy_exp")
-    lin_track_reward_weight = reward._term_cfgs[lin_track_reward_idx].weight
-    ang_track_reward_sum = (
-        reward._episode_sums["track_ang_vel_z_exp"][env_ids] / env.max_episode_length_s
-    )
-    ang_track_reward_idx = reward._term_names.index("track_ang_vel_z_exp")
-    ang_track_reward_weight = reward._term_cfgs[ang_track_reward_idx].weight
-    # compute the distance the robot walked
+    # compute the distance the robot walked from its spawn origin
     distance = torch.norm(
         asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1
     )
-    # robots that walked far enough progress to harder terrains
-    move_up = (
-        (distance > terrain.cfg.terrain_generator.size[0] / 2)
-        & (lin_track_reward_sum > lin_track_reward_weight * 0.7)
-        & (ang_track_reward_sum > ang_track_reward_weight * 0.7)
-    )
-    # robots that walked less than half of their required distance go to simpler terrains
-    move_down = (lin_track_reward_sum < lin_track_reward_weight * 0.6) | (
-        ang_track_reward_sum < ang_track_reward_weight * 0.6
-    )
+    terrain_size = terrain.cfg.terrain_generator.size[0]
+    # bfm_training style: promote if robot walked far enough (traversed the terrain)
+    move_up = distance > terrain_size / 2
+    # demote if robot barely moved (couldn't traverse)
+    move_down = distance < terrain_size / 4
     move_down *= ~move_up
 
     # terrain level transition counters
@@ -152,29 +136,21 @@ def command_levels_vel(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
     delta: list[float],
-    max_curriculum: list[tuple[float, float]]
+    max_curriculum: list[tuple[float, float]],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> None:
     vel_cmd = env.command_manager.get_term("base_velocity")
     delta_tensor = torch.tensor(delta, device=env.device).unsqueeze(-1)
     deltas = delta_tensor * torch.tensor([-1, 1], device=env.device)
 
     if not hasattr(env, "vel_update_ids"):
-        reward: RewardManager = env.reward_manager
-        lin_track_reward_sum = (
-            reward._episode_sums["track_lin_vel_xy_exp"][env_ids] / env.max_episode_length_s
+        asset: Articulation = env.scene[asset_cfg.name]
+        terrain: TerrainImporter = env.scene.terrain
+        distance = torch.norm(
+            asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1
         )
-        lin_track_reward_idx = reward._term_names.index("track_lin_vel_xy_exp")
-        lin_track_reward_weight = reward._term_cfgs[lin_track_reward_idx].weight
-        ang_track_reward_sum = (
-            reward._episode_sums["track_ang_vel_z_exp"][env_ids] / env.max_episode_length_s
-        )
-        ang_track_reward_idx = reward._term_names.index("track_ang_vel_z_exp")
-        ang_track_reward_weight = reward._term_cfgs[ang_track_reward_idx].weight
-        # robots that walked far enough progress to harder terrains
-        mask = (
-            (lin_track_reward_sum.mean() > lin_track_reward_weight * 0.8)
-            & (ang_track_reward_sum.mean() > ang_track_reward_weight * 0.7)
-        )
+        terrain_size = terrain.cfg.terrain_generator.size[0]
+        mask = distance > terrain_size / 2
         vel_update_ids = env_ids[mask]
         if vel_update_ids.numel() > 0:
             vel_cmd.lin_vel_x_ranges[vel_update_ids] = torch.clamp(
@@ -204,25 +180,14 @@ def command_levels_vel(
     failed_mask = torch.isin(env_ids, env.vel_update_ids[env.vel_ids_terrain_failed_mask])
     failed_env_ids = env_ids[failed_mask]
 
-    # Fallback: if no terrain-driven updates are available, still progress command curriculum
-    # from velocity tracking performance so speed curriculum doesn't stall at initial ranges.
     if passed_env_ids.numel() == 0 and failed_env_ids.numel() == 0:
-        reward: RewardManager = env.reward_manager
-        lin_track_reward_sum = (
-            reward._episode_sums["track_lin_vel_xy_exp"][env_ids] / env.max_episode_length_s
+        asset: Articulation = env.scene[asset_cfg.name]
+        terrain: TerrainImporter = env.scene.terrain
+        distance = torch.norm(
+            asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1
         )
-        lin_track_reward_idx = reward._term_names.index("track_lin_vel_xy_exp")
-        lin_track_reward_weight = reward._term_cfgs[lin_track_reward_idx].weight
-        ang_track_reward_sum = (
-            reward._episode_sums["track_ang_vel_z_exp"][env_ids] / env.max_episode_length_s
-        )
-        ang_track_reward_idx = reward._term_names.index("track_ang_vel_z_exp")
-        ang_track_reward_weight = reward._term_cfgs[ang_track_reward_idx].weight
-
-        passed_env_ids = env_ids[
-            (lin_track_reward_sum > lin_track_reward_weight * 0.8)
-            & (ang_track_reward_sum > ang_track_reward_weight * 0.7)
-        ]
+        terrain_size = terrain.cfg.terrain_generator.size[0]
+        passed_env_ids = env_ids[distance > terrain_size / 2]
 
     if passed_env_ids.numel() > 0:
         # Update the linear velocity ranges for the environments that performed well

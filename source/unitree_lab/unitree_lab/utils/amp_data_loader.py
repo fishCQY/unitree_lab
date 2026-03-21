@@ -31,12 +31,26 @@ Usage:
 
 from __future__ import annotations
 
+import io
 import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
 import torch
+
+
+class _NumpyCompatUnpickler(pickle.Unpickler):
+    """Map numpy 2.x pickle paths (``numpy._core``) to numpy 1.x (``numpy.core``)."""
+
+    def find_class(self, module: str, name: str) -> Any:
+        if module.startswith("numpy._core"):
+            module = module.replace("numpy._core", "numpy.core", 1)
+        return super().find_class(module, name)
+
+
+def _compat_pickle_load(f: io.BufferedIOBase) -> Any:
+    return _NumpyCompatUnpickler(f).load()
 
 
 @dataclass
@@ -206,7 +220,7 @@ def load_amp_motion_data(
             raise FileNotFoundError(f"Motion file not found: {motion_file}")
 
         with open(motion_file, "rb") as f:
-            raw = pickle.load(f)
+            raw = _compat_pickle_load(f)
 
         for motion in _flatten_motion_pkl(raw):
             features = _extract_features(motion, keys, point_indices)
@@ -283,7 +297,7 @@ def load_conditional_amp_data(
                 continue
 
             with open(motion_file, "rb") as f:
-                raw = pickle.load(f)
+                raw = _compat_pickle_load(f)
 
             for motion in _flatten_motion_pkl(raw):
                 features = _extract_features(motion, keys, point_indices)

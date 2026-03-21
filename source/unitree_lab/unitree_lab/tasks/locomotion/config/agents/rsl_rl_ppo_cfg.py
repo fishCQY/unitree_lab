@@ -58,11 +58,8 @@ class AMPPluginCfg:
     loss_type: str = "LSGAN"
     """Discriminator loss type: 'GAN', 'LSGAN', or 'WGAN'."""
 
-    style_reward_scale: float = 1.0
-    """Scaling factor for style reward."""
-
-    task_style_lerp: float = 0.5
-    """Interpolation weight: total = lerp*task + (1-lerp)*style."""
+    style_reward_scale: float = 2.0
+    """Scaling factor for style reward. total = task + scale * style * dt."""
 
     # Discriminator architecture
     hidden_dims: list[int] = MISSING
@@ -143,7 +140,7 @@ class UnitreeG1RoughPluginRunnerCfg(RslRlOnPolicyRunnerCfg):
 
     class_name = "AMPPluginRunner"
     num_steps_per_env = 24
-    max_iterations = 200000
+    max_iterations = 15000
     save_interval = 500
     experiment_name = "unitree_g1_rough_plugin"
     empirical_normalization = True
@@ -181,8 +178,7 @@ class UnitreeG1RoughPluginRunnerCfg(RslRlOnPolicyRunnerCfg):
         condition_obs_group="amp_condition",
         num_frames=2,
         loss_type="LSGAN",
-        style_reward_scale=1.0,
-        task_style_lerp=0.5,
+        style_reward_scale=2.0,
         hidden_dims=[1024, 512],
         activation="relu",
         disc_learning_rate=5e-4,
