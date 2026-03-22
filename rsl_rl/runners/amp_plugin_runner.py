@@ -7,9 +7,13 @@ Data flow:
     1. Environment outputs single-step AMP observations (obs["amp"])
     2. During rollout, AMPPlugin.reward() builds multi-frame sequences
        from the RolloutStorage and computes style reward
-    3. Style reward is blended with task reward via lerp
+    3. Style reward is combined additively with task reward
     4. After PPO update, AMPPlugin.update() trains the discriminator
        using sequences from the rollout and the offline dataset
+
+Sim2Sim (bfm_training style):
+    On each checkpoint save, the runner directly calls MuJoCo sim2sim
+    evaluation and uploads video + metrics to W&B. No subprocess needed.
 
 Usage:
     In the runner config, set:
@@ -19,15 +23,19 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import os
 import statistics
 import time
 import torch
 from collections import deque
+from pathlib import Path
 
 from rsl_rl.env import VecEnv
 from rsl_rl.plugins import AMPPlugin
 from rsl_rl.runners import OnPolicyRunner
+
+logger = logging.getLogger(__name__)
 
 
 class AMPPluginRunner(OnPolicyRunner):
@@ -75,6 +83,10 @@ class AMPPluginRunner(OnPolicyRunner):
         self._cur_style_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         self._cur_total_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         self._step_dt = self.env.unwrapped.step_dt
+
+        # Sim2sim config (set by train.py before learn())
+        self.sim2sim_cfg: dict | None = None
+        self._sim2sim_save_count = 0
 
     def _load_amp_offline_data(self) -> None:
         """Load offline motion data for the AMP discriminator."""
@@ -185,9 +197,10 @@ class AMPPluginRunner(OnPolicyRunner):
             # ---- Logging ----
             self._log_iteration(it, start_it, total_it, collect_time, learn_time, loss_dict)
 
-            # ---- Save ----
+            # ---- Save + Sim2Sim ----
             if it % self.cfg["save_interval"] == 0:
                 self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))
+                self._maybe_run_sim2sim(it)
 
         if self.logger.log_dir is not None and not self.logger.disable_logs:
             self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))
@@ -223,6 +236,316 @@ class AMPPluginRunner(OnPolicyRunner):
             learning_rate=self.alg.learning_rate,
             action_std=self.alg.policy.action_std,
             rnd_weight=self.alg.rnd.weight if self.alg_cfg.get("rnd_cfg") else None,
+        )
+
+    # ------------------------------------------------------------------
+    # Sim2Sim (bfm_training style: direct call, no subprocess)
+    # ------------------------------------------------------------------
+
+    def _maybe_run_sim2sim(self, iteration: int) -> None:
+        """Run sim2sim evaluation if configured. Called after checkpoint save."""
+        if self.sim2sim_cfg is None:
+            return
+        self._sim2sim_save_count += 1
+        every = max(1, self.sim2sim_cfg.get("every", 1))
+        if (self._sim2sim_save_count % every) != 0:
+            return
+        try:
+            self._run_sim2sim(iteration)
+        except Exception as e:
+            logger.warning(f"[Sim2Sim] Failed at iter {iteration}: {e}")
+
+    def _run_sim2sim(self, iteration: int) -> None:
+        """Export ONNX, run MuJoCo eval, record video, upload to W&B."""
+        cfg = self.sim2sim_cfg
+        log_dir = self.logger.log_dir
+
+        # 1. Export ONNX
+        export_dir = os.path.join(log_dir, "export")
+        os.makedirs(export_dir, exist_ok=True)
+        onnx_path = self._export_onnx(export_dir, iteration)
+        if onnx_path is None:
+            return
+
+        # 2. Build deploy.yaml
+        deploy_yaml_path = self._build_deploy_yaml(export_dir, iteration)
+
+        # 3. Run sim2sim in-process with EGL
+        os.environ["MUJOCO_GL"] = "egl"
+
+        task_name = cfg.get("task", "rough_forward")
+        duration = cfg.get("duration", 20.0)
+        robot = cfg.get("robot", "g1")
+        velocity = cfg.get("velocity", (1.0, 0.0, 0.0))
+        xml_path = cfg.get("xml_path")
+
+        out_dir = os.path.join(log_dir, "sim2sim", f"iter_{iteration}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        try:
+            sim2sim_script_dir = Path(__file__).resolve().parents[1] / "scripts" / "mujoco_eval"
+            import sys as _sys
+            if str(sim2sim_script_dir.parent.parent) not in _sys.path:
+                _sys.path.insert(0, str(sim2sim_script_dir.parent.parent))
+
+            from unitree_lab.mujoco_utils.evaluation.eval_task import get_eval_task
+            from unitree_lab.mujoco_utils.simulation.base_simulator import BaseMujocoSimulator
+
+            task = get_eval_task(task_name)
+            policy_dt = 0.02
+            max_steps = int(duration / policy_dt)
+
+            config_override = {}
+            if deploy_yaml_path and os.path.isfile(deploy_yaml_path):
+                config_override = self._load_deploy_override(deploy_yaml_path)
+
+            if xml_path is None:
+                _, xml_path = self._find_sim2sim_xml(task_name)
+            if xml_path is None:
+                logger.warning("[Sim2Sim] No XML found, skipping.")
+                return
+
+            simulator = BaseMujocoSimulator(
+                xml_path=str(xml_path),
+                onnx_path=str(onnx_path),
+                config_override=config_override if config_override else None,
+            )
+
+            video_path = self._record_sim2sim_video(
+                simulator, task, out_dir, max_steps, velocity=velocity,
+            )
+
+            if video_path and os.path.isfile(video_path):
+                self._log_sim2sim_to_wandb(video_path, iteration)
+                print(f"[Sim2Sim] Video uploaded (it={iteration}): {video_path}")
+            else:
+                logger.warning(f"[Sim2Sim] No video produced at iter {iteration}")
+
+        except Exception as e:
+            logger.warning(f"[Sim2Sim] Error during eval: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _export_onnx(self, export_dir: str, iteration: int) -> str | None:
+        """Export policy to ONNX format."""
+        try:
+            import onnx
+
+            policy = self.alg.policy
+            policy.eval()
+            if not hasattr(policy, "actor"):
+                return None
+
+            obs_dim = policy.actor[0].in_features
+            example_input = torch.zeros(1, obs_dim, device=self.device)
+            filename = f"policy_iter_{iteration}.onnx"
+            onnx_path = os.path.join(export_dir, filename)
+
+            class _Wrapper(torch.nn.Module):
+                def __init__(self, p):
+                    super().__init__()
+                    self.actor = p.actor
+                    self.actor_obs_normalizer = p.actor_obs_normalizer
+                    self.state_dependent_std = getattr(p, "state_dependent_std", False)
+                def forward(self, obs_):
+                    obs_ = self.actor_obs_normalizer(obs_)
+                    if self.state_dependent_std:
+                        return self.actor(obs_)[..., 0, :]
+                    return self.actor(obs_)
+
+            wrapped = _Wrapper(policy)
+            wrapped.eval()
+            torch.onnx.export(
+                wrapped, example_input, onnx_path,
+                input_names=["obs"], output_names=["actions"],
+                dynamic_axes={"obs": {0: "batch"}, "actions": {0: "batch"}},
+                opset_version=11,
+            )
+            onnx.checker.check_model(onnx.load(onnx_path))
+
+            try:
+                from unitree_lab.utils.onnx_utils import build_onnx_metadata, attach_onnx_metadata
+                base_env = getattr(self.env, "unwrapped", self.env)
+                meta = build_onnx_metadata(base_env)
+                attach_onnx_metadata(onnx_path, meta)
+                print(f"[ONNX] Attached metadata to {onnx_path}")
+            except Exception:
+                pass
+
+            policy.train()
+            return onnx_path
+        except Exception as e:
+            logger.warning(f"[Sim2Sim] ONNX export failed: {e}")
+            return None
+
+    def _build_deploy_yaml(self, export_dir: str, iteration: int) -> str | None:
+        """Build deploy.yaml from ONNX metadata."""
+        try:
+            from unitree_lab.utils.onnx_utils import build_onnx_metadata
+            from isaaclab.utils.io import dump_yaml
+
+            base_env = getattr(self.env, "unwrapped", self.env)
+            meta = build_onnx_metadata(base_env)
+            deploy = self._meta_to_deploy(meta)
+            path = os.path.join(export_dir, f"deploy_iter_{iteration}.yaml")
+            dump_yaml(path, deploy)
+            dump_yaml(os.path.join(export_dir, "deploy_latest.yaml"), deploy)
+            return path
+        except Exception:
+            return None
+
+    @staticmethod
+    def _meta_to_deploy(meta: dict) -> dict:
+        deploy: dict = {}
+        for src, dst in [
+            ("joint_names", "joint_names"), ("default_joint_pos", "default_joint_pos"),
+            ("joint_stiffness", "stiffness"), ("joint_damping", "damping"),
+            ("joint_armature", "armature"),
+        ]:
+            if isinstance(meta.get(src), list):
+                deploy[dst] = meta[src]
+        if meta.get("policy_dt") is not None:
+            try:
+                deploy["step_dt"] = float(meta["policy_dt"])
+            except Exception:
+                pass
+        actions: dict = {}
+        jpa: dict = {}
+        if isinstance(meta.get("action_scale"), list):
+            jpa["scale"] = meta["action_scale"]
+        if isinstance(meta.get("action_offset"), list):
+            jpa["offset"] = meta["action_offset"]
+        if jpa:
+            actions["JointPositionAction"] = jpa
+        if actions:
+            deploy["actions"] = actions
+        if isinstance(meta.get("observation_names"), list):
+            deploy["observation_names"] = meta["observation_names"]
+        if isinstance(meta.get("observation_dims"), list):
+            deploy["observation_dims"] = meta["observation_dims"]
+        if meta.get("history_length") is not None:
+            try:
+                deploy["history_length"] = int(meta["history_length"])
+            except Exception:
+                pass
+        if isinstance(meta.get("single_frame_dims"), dict):
+            deploy["single_frame_dims"] = meta["single_frame_dims"]
+        return deploy
+
+    @staticmethod
+    def _load_deploy_override(yaml_path: str) -> dict:
+        """Load deploy.yaml and convert to config override."""
+        import yaml
+        with open(yaml_path) as f:
+            deploy = yaml.safe_load(f) or {}
+        override: dict = {}
+        key_map = {
+            "joint_stiffness": "joint_stiffness", "joint_damping": "joint_damping",
+            "joint_names": "joint_names", "default_joint_pos": "default_joint_pos",
+            "action_scale": "action_scale", "action_offset": "action_offset",
+            "observation_names": "observation_names", "observation_dims": "observation_dims",
+            "sim_dt": "sim_dt", "decimation": "decimation", "joint_armature": "joint_armature",
+            "history_length": "history_length", "single_frame_dims": "single_frame_dims",
+            "stiffness": "joint_stiffness", "damping": "joint_damping", "armature": "joint_armature",
+        }
+        for src, dst in key_map.items():
+            if src in deploy and dst not in override:
+                override[dst] = deploy[src]
+        jpa = deploy.get("actions", {}).get("JointPositionAction", {})
+        if "scale" in jpa and "action_scale" not in override:
+            override["action_scale"] = jpa["scale"]
+        if "offset" in jpa and "action_offset" not in override:
+            override["action_offset"] = jpa["offset"]
+        return override
+
+    @staticmethod
+    def _record_sim2sim_video(
+        simulator, task, output_dir: str, duration_steps: int,
+        velocity=None,
+    ) -> str | None:
+        """Record sim2sim video with EGL rendering."""
+        try:
+            import cv2
+            import mujoco
+            import numpy as np
+        except ImportError:
+            logger.warning("[Sim2Sim] cv2 or mujoco not available; skipping video.")
+            return None
+
+        out_path = Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+
+        width, height = 1280, 720
+        if simulator.model.vis.global_.offwidth < width:
+            simulator.model.vis.global_.offwidth = width
+        if simulator.model.vis.global_.offheight < height:
+            simulator.model.vis.global_.offheight = height
+        renderer = mujoco.Renderer(simulator.model, height, width)
+
+        cam = mujoco.MjvCamera()
+        cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        base_body_id = getattr(simulator, "_base_body_id", None)
+        cam.trackbodyid = base_body_id if (base_body_id is not None and base_body_id > 0) else 1
+        cam.distance = 3.0
+        cam.azimuth = -150
+        cam.elevation = -20
+        cam.lookat[:] = [0, 0, 0.8]
+
+        simulator.reset()
+        vel_cmd = velocity if velocity is not None else (0.5, 0.0, 0.0)
+        simulator.set_velocity_command(*vel_cmd)
+
+        frames = []
+        for _ in range(duration_steps):
+            renderer.update_scene(simulator.data, camera=cam)
+            frames.append(renderer.render().copy())
+            simulator.step()
+
+        video_file = out_path / f"{task.name}_sim2sim.mp4"
+        fps = int(1.0 / simulator.policy_dt) if simulator.policy_dt > 0 else 50
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(video_file), fourcc, fps, (width, height))
+        for frame in frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        writer.release()
+
+        try:
+            import subprocess
+            tmp = video_file.with_suffix(".h264_tmp.mp4")
+            subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-i", str(video_file), "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                 "-movflags", "+faststart", "-preset", "veryfast", "-crf", "23",
+                 str(tmp)], check=True,
+            )
+            tmp.replace(video_file)
+        except Exception:
+            pass
+
+        return str(video_file)
+
+    def _find_sim2sim_xml(self, task: str = "rough_forward"):
+        rl_lab_root = Path(__file__).resolve().parents[1]
+        script = rl_lab_root / "scripts" / "mujoco_eval" / "run_sim2sim_locomotion.py"
+        xml_dir = rl_lab_root / "source" / "unitree_lab" / "unitree_lab" / "assets" / "robots_xml" / "g1"
+        terrain_tasks = {"rough_forward", "stairs_up", "stairs_down", "slope_up", "mixed_terrain"}
+        terrain_xml = xml_dir / "scene_29dof_terrain.xml"
+        flat_xml = xml_dir / "scene_29dof.xml"
+        xml = terrain_xml if (task in terrain_tasks and terrain_xml.exists()) else flat_xml
+        return (str(script) if script.exists() else None, str(xml) if xml.exists() else None)
+
+    @staticmethod
+    def _log_sim2sim_to_wandb(mp4_path: str, iteration: int) -> None:
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+        wandb.log(
+            {"sim2sim_video": wandb.Video(mp4_path, format="mp4", caption=f"iter_{iteration}")},
+            step=int(iteration),
+            commit=False,
         )
 
     # ------------------------------------------------------------------

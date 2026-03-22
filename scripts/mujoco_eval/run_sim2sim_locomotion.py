@@ -24,10 +24,13 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("MUJOCO_GL", "egl")
 
 # Ensure unitree_lab.mujoco_utils is importable even when the full Isaac Lab
 # environment is not available (unitree_lab.__init__ imports isaaclab_tasks).

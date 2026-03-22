@@ -38,15 +38,24 @@ def terrain_levels_vel(
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
     terrain: TerrainImporter = env.scene.terrain
-    # compute the distance the robot walked from its spawn origin
+    reward: RewardManager = env.reward_manager
     distance = torch.norm(
         asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1
     )
     terrain_size = terrain.cfg.terrain_generator.size[0]
-    # bfm_training style: promote if robot walked far enough (traversed the terrain)
-    move_up = distance > terrain_size / 2
-    # demote if robot barely moved (couldn't traverse)
-    move_down = distance < terrain_size / 4
+
+    episode_length = env.episode_length_buf[env_ids].clamp(min=1).float()
+    lin_track_mean = reward._episode_sums["track_lin_vel_xy_exp"][env_ids] / episode_length
+    ang_track_mean = reward._episode_sums["track_ang_vel_z_exp"][env_ids] / episode_length
+
+    # Promote: walked far enough AND tracking quality is acceptable
+    move_up = (
+        (distance > terrain_size / 2)
+        & (lin_track_mean > 0.5)
+        & (ang_track_mean > 0.3)
+    )
+    # Demote: barely moved OR tracking is very poor
+    move_down = (distance < terrain_size / 4) | (lin_track_mean < 0.2)
     move_down *= ~move_up
 
     # terrain level transition counters

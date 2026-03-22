@@ -90,9 +90,6 @@ import gymnasium as gym
 import json
 import logging
 import os
-import queue
-import subprocess
-import threading
 import time
 import numpy as np
 import torch
@@ -381,169 +378,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
     # -------------------------------------------------------------------------
-    # Sim2Sim integration: on each checkpoint save, export ONNX -> run MuJoCo
-    # eval in a subprocess -> upload the video to W&B.
+    # Sim2Sim integration (bfm_training style: runner-built-in, no subprocess)
     # -------------------------------------------------------------------------
-    sim2sim_enabled = bool(getattr(args_cli, "sim2sim", False))
-    sim2sim_task = str(getattr(args_cli, "sim2sim_task", "rough_forward"))
-    sim2sim_script, sim2sim_default_xml = _find_sim2sim_resources(task=sim2sim_task)
-    sim2sim_jobs: queue.Queue = queue.Queue()
-    sim2sim_sema = threading.BoundedSemaphore(value=1)
-
-    if sim2sim_enabled and sim2sim_script is None:
-        print("[Sim2Sim][WARN] Could not find run_sim2sim_locomotion.py in ~/unitree_lab. Sim2sim disabled.")
-        sim2sim_enabled = False
-
-    def _sim2sim_poller():
-        """Background thread: wait for subprocess to finish, then upload to W&B."""
-        while True:
-            job = sim2sim_jobs.get()
-            if job is None:
-                return
-            proc = job.get("proc")
-            if proc is None:
-                continue
-            proc.wait()
-            it = int(job.get("it", 0))
-            rc = proc.returncode
-            if rc != 0:
-                log_path = job.get("out_dir", "")
-                print(f"[Sim2Sim][WARN] subprocess exited with code {rc} (it={it}). Check {log_path}/sim2sim.log")
-            mp4_path = job.get("mp4_path")
-            if mp4_path and os.path.isfile(mp4_path):
-                _log_sim2sim_video_to_wandb(mp4_path, it)
-                print(f"[Sim2Sim] Video uploaded to W&B (it={it}): {mp4_path}")
-            elif mp4_path:
-                print(f"[Sim2Sim][WARN] Video not found (it={it}): {mp4_path}")
-            try:
-                lf = job.get("log_f")
-                if lf:
-                    lf.close()
-            except Exception:
-                pass
-            try:
-                if job.get("sema_acquired"):
-                    sim2sim_sema.release()
-            except Exception:
-                pass
-
-    sim2sim_thread = None
-    if sim2sim_enabled:
-        sim2sim_thread = threading.Thread(target=_sim2sim_poller, daemon=True)
-        sim2sim_thread.start()
-
-    _orig_save = runner.save
-    _save_count = {"n": 0}
-
-    def _save_with_sim2sim(path: str, infos=None) -> None:
-        _orig_save(path, infos=infos)
-        if not sim2sim_enabled:
-            return
-        _save_count["n"] += 1
-        every = max(1, int(getattr(args_cli, "sim2sim_every", 1)))
-        if (_save_count["n"] % every) != 0:
-            return
-
-        sema_acquired = sim2sim_sema.acquire(blocking=False)
-        if not sema_acquired:
-            print("[Sim2Sim] skipped: previous sim2sim still running.")
-            return
-
-        it = int(getattr(runner, "current_learning_iteration", 0))
-        try:
-            export_dir = os.path.join(log_dir, "export")
-            onnx_path = _export_policy_to_onnx(runner, export_dir, filename=f"policy_iter_{it}.onnx")
-            # Attach IsaacLab metadata to ONNX so MuJoCo sim2sim can match:
-            # - joint order (joint_names)
-            # - action scale/offset
-            # - observation layout + history stacking
-            # - PD gains and timing (policy_dt/decimation/sim_dt)
-            try:
-                from unitree_lab.utils.onnx_utils import build_onnx_metadata
-
-                # build_onnx_metadata expects the underlying IsaacLab env (ManagerBasedRLEnv),
-                # not the RSL-RL wrapper.
-                base_env = getattr(env, "unwrapped", env)
-                meta = build_onnx_metadata(base_env)
-
-                # Always dump a deploy.yaml next to the ONNX for robust sim2sim debugging.
-                # This does NOT require attaching metadata to ONNX.
-                deploy_yaml = _build_deploy_yaml_from_metadata(meta)
-                deploy_yaml_path = os.path.join(export_dir, f"deploy_iter_{it}.yaml")
-                dump_yaml(deploy_yaml_path, deploy_yaml)
-                # Also keep a stable "latest" pointer for convenience.
-                dump_yaml(os.path.join(export_dir, "deploy_latest.yaml"), deploy_yaml)
-
-                # Best-effort: attach metadata_json to the ONNX (requires the `onnx` package).
-                try:
-                    from unitree_lab.utils.onnx_utils import attach_onnx_metadata
-                    attach_onnx_metadata(onnx_path, meta)
-                except Exception as e:
-                    print(f"[Sim2Sim][WARN] Failed to attach ONNX metadata_json (deploy.yaml still written): {e}")
-            except Exception as e:
-                print(f"[Sim2Sim][WARN] Failed to build sim2sim deploy metadata: {e}")
-        except Exception as e:
-            print(f"[Sim2Sim][WARN] ONNX export failed: {e}")
-            sim2sim_sema.release()
-            return
-
-        out_dir = os.path.join(log_dir, "sim2sim", f"iter_{it}")
-        os.makedirs(out_dir, exist_ok=True)
-
-        xml_path = getattr(args_cli, "sim2sim_xml", None) or (str(sim2sim_default_xml) if sim2sim_default_xml else None)
-        if xml_path is None:
-            print("[Sim2Sim][WARN] No MuJoCo XML found. Skipping.")
-            sim2sim_sema.release()
-            return
-
-        duration = float(getattr(args_cli, "sim2sim_duration", 30.0))
-        max_steps = int(duration / 0.02)  # ~50Hz policy rate -> 250 steps for 5s
-        mp4_path = os.path.join(out_dir, f"{sim2sim_task}_sim2sim.mp4")
-        sim2sim_log = os.path.join(out_dir, "sim2sim.log")
-
-        deploy_yaml_path = os.path.join(export_dir, "deploy_latest.yaml")
-        cmd = [
-            sys.executable, str(sim2sim_script),
-            "--robot", str(getattr(args_cli, "sim2sim_robot", "g1")),
-            "--onnx", str(onnx_path),
-            "--xml", str(xml_path),
-            "--task", sim2sim_task,
-            "--num-episodes", "1",
-            "--max-steps", str(max_steps),
-            "--output-dir", str(out_dir),
-            "--save-video",
-            "--video-steps", str(max_steps),
-            "--velocity", "1.0", "0.0", "0.0",
-        ]
-        if os.path.isfile(deploy_yaml_path):
-            cmd += ["--deploy-yaml", deploy_yaml_path]
-
-        try:
-            log_f = open(sim2sim_log, "w")
-            proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT)
-            sim2sim_jobs.put({
-                "it": it, "proc": proc, "mp4_path": mp4_path,
-                "log_f": log_f, "sema_acquired": True, "out_dir": out_dir,
-            })
-            print(f"[Sim2Sim] spawned (it={it}, duration={duration}s) -> {out_dir}")
-        except Exception as e:
-            print(f"[Sim2Sim][WARN] Failed to spawn: {e}")
-            sim2sim_sema.release()
-
-    runner.save = _save_with_sim2sim
+    if bool(getattr(args_cli, "sim2sim", False)):
+        sim2sim_task = str(getattr(args_cli, "sim2sim_task", "rough_forward"))
+        _, sim2sim_xml = _find_sim2sim_resources(task=sim2sim_task)
+        runner.sim2sim_cfg = {
+            "task": sim2sim_task,
+            "duration": float(getattr(args_cli, "sim2sim_duration", 20.0)),
+            "robot": str(getattr(args_cli, "sim2sim_robot", "g1")),
+            "every": max(1, int(getattr(args_cli, "sim2sim_every", 1))),
+            "velocity": (1.0, 0.0, 0.0),
+            "xml_path": getattr(args_cli, "sim2sim_xml", None) or sim2sim_xml,
+        }
 
     try:
-        # run training
         runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
     finally:
-        if sim2sim_thread is not None:
-            # Signal poller to exit, then wait for any in-flight sim2sim job to finish
-            # so the video is uploaded to W&B before we tear down the run.
-            sim2sim_jobs.put(None)
-            sim2sim_thread.join(timeout=120)
-            if sim2sim_thread.is_alive():
-                print("[Sim2Sim][WARN] Poller thread still alive after 120s timeout.")
-        # finalize W&B if active
         try:
             writer = getattr(getattr(runner, "logger", None), "writer", None)
             if writer is not None and hasattr(writer, "stop"):

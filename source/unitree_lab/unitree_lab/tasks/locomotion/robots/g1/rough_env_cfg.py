@@ -184,11 +184,6 @@ class G1ObservationsCfg:
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
         actions = ObsTerm(func=mdp.last_action)
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
-        height_scan = ObsTerm(
-            func=mdp.height_scan,
-            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
-            noise=Unoise(n_min=-0.1, n_max=0.1), clip=(-1.0, 1.0),
-        )
         joint_torques = ObsTerm(func=mdp.joint_torques)
         joint_accs = ObsTerm(func=mdp.joint_accs)
         feet_lin_vel = ObsTerm(func=mdp.feet_lin_vel, params={"asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*")})
@@ -203,18 +198,6 @@ class G1ObservationsCfg:
         action_delay_wrist = ObsTerm(func=mdp.action_delay, params={"actuators_names": "wrist"})
         push_force = ObsTerm(func=mdp.push_force, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
         push_torque = ObsTerm(func=mdp.push_torque, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
-        contact_information = ObsTerm(
-            func=mdp.contact_information,
-            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[
-                'pelvis', 'left_hip_pitch_link', 'left_hip_roll_link', 'left_hip_yaw_link',
-                'left_knee_link', 'right_hip_pitch_link', 'right_hip_roll_link', 'right_hip_yaw_link',
-                'right_knee_link', 'waist_yaw_link', 'waist_roll_link', 'torso_link',
-                'left_shoulder_pitch_link', 'left_shoulder_roll_link', 'left_shoulder_yaw_link', 'left_elbow_link',
-                'left_wrist_roll_link', 'left_wrist_pitch_link', 'left_wrist_yaw_link',
-                'right_shoulder_pitch_link', 'right_shoulder_roll_link', 'right_shoulder_yaw_link',
-                'right_elbow_link', 'right_wrist_roll_link', 'right_wrist_pitch_link', 'right_wrist_yaw_link',
-            ])},
-        )
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -332,13 +315,6 @@ class G1TerminationsCfg:
 @configclass
 class G1CurriculumCfg:
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
-    command_levels = CurrTerm(
-        func=mdp.command_levels_vel,
-        params={
-            "delta": [0.1, 0.05, 0.3],
-            "max_curriculum": [(-2.0, 2.0), (-0.5, 0.5), (-2.0, 2.0)],
-        },
-    )
 
 
 # =============================================================================
@@ -365,6 +341,7 @@ class UnitreeG1RoughEnvCfg(LocomotionEnvCfg):
         self.actions.joint_pos.scale = 0.25
         self.actions.joint_pos.clip = {".*": [-100.0, 100]}
         self.observations.policy.height_scan = None
+        self.scene.height_scanner = None
         self.commands.base_velocity.ranges.ang_vel_z = (-2.0, 2.0)
         self.commands.base_velocity.resampling_time_range = (4.0, 6.0)
         self.commands.base_velocity.rel_standing_envs = 0.1
