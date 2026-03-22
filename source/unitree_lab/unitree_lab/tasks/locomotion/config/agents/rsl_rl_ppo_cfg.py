@@ -131,42 +131,48 @@ class AMPPluginCfg:
 
 @configclass
 class UnitreeG1RoughPluginRunnerCfg(RslRlOnPolicyRunnerCfg):
-    """Plugin-based AMP runner: PPO stays vanilla, AMP is a standalone plugin.
+    """Default AMP runner: GRU policy + AMPPlugin (aligned with bfm_training).
 
-    Uses single-step 'amp' observation group; the plugin builds multi-frame
-    sequences internally from the rollout storage. Supports conditional AMP,
-    key-point observations, mirror augmentation, training noise, and multi-GPU.
+    Key differences from previous config:
+    - GRU policy (rnn_hidden_dim=512) instead of MLP
+    - lr=1e-5 (adaptive), entropy=0.01
+    - Discriminator: lr_scale=1.0 (follows policy lr), 2 epochs × 2 batches
+    - max_iterations=20000 (longer episodes compensate)
     """
 
     class_name = "AMPPluginRunner"
     num_steps_per_env = 24
-    max_iterations = 15000
+    max_iterations = 20000
     save_interval = 500
-    experiment_name = "unitree_g1_rough_plugin"
+    experiment_name = "unitree_g1_rough"
     empirical_normalization = True
     obs_groups = {
         "policy": ["policy"],
         "critic": ["critic"],
         "amp": ["amp"],
         "amp_condition": ["amp_condition"],
+        "symmetry": ["symmetry"],
     }
-    policy = RslRlPpoActorCriticCfg(
+    policy = RslRlPpoActorCriticRecurrentCfg(
         init_noise_std=1.0,
-        actor_hidden_dims=[1024, 512, 256],
+        actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[1024, 512, 256],
         activation="elu",
         actor_obs_normalization=True,
         critic_obs_normalization=True,
+        rnn_type="gru",
+        rnn_hidden_dim=512,
+        rnn_num_layers=1,
     )
     algorithm = _RslRlPpoAlgorithmCfg(
         class_name="PPO",
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.005,
+        entropy_coef=0.01,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
+        learning_rate=1.0e-5,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
@@ -181,48 +187,54 @@ class UnitreeG1RoughPluginRunnerCfg(RslRlOnPolicyRunnerCfg):
         style_reward_scale=2.0,
         hidden_dims=[1024, 512],
         activation="relu",
-        disc_learning_rate=5e-4,
+        lr_scale=1.0,
         disc_trunk_weight_decay=1e-4,
         disc_linear_weight_decay=1e-2,
         disc_max_grad_norm=0.5,
-        disc_num_learning_epochs=5,
-        disc_num_mini_batches=4,
+        disc_num_learning_epochs=2,
+        disc_num_mini_batches=2,
         grad_penalty_scale=10.0,
         noise_scale=None,
         num_conditions=2,
         condition_embedding_dim=16,
         mirror=False,
     )
-
+    symmetry_classifier = {
+        "obs_group": "symmetry",
+        "num_frames": 2,
+        "cls_hidden_dims": [1024, 512],
+        "activation": "relu",
+        "obs_normalization": True,
+        "reward_weight": 0.5,
+        "lr_scale": 0.5,
+        "grad_pen_weight": 0.5,
+        "num_learning_epochs": 5,
+        "num_mini_batches": 4,
+        "mirror_obs_func": "cfg.mirror_obs",
+    }
 
 
 @configclass
 class UnitreeG1FlatPluginRunnerCfg(UnitreeG1RoughPluginRunnerCfg):
-    """Flat terrain variant of the plugin-based AMP runner."""
+    """Flat terrain variant."""
 
     def __post_init__(self):
         super().__post_init__()
-        self.max_iterations = 60000
-        self.experiment_name = "unitree_g1_flat_plugin"
-        self.policy.actor_hidden_dims = [512, 256, 128]
-        self.policy.critic_hidden_dims = [512, 256, 128]
+        self.experiment_name = "unitree_g1_flat"
 
 
 @configclass
-class UnitreeG1RoughPluginGRURunnerCfg(UnitreeG1RoughPluginRunnerCfg):
-    """GRU variant of the plugin-based AMP runner."""
+class UnitreeG1RoughMLPRunnerCfg(UnitreeG1RoughPluginRunnerCfg):
+    """MLP variant (no recurrence) for faster iteration or ablation."""
 
     def __post_init__(self):
         super().__post_init__()
-        self.experiment_name = "unitree_g1_rough_plugin_gru"
-        self.policy = RslRlPpoActorCriticRecurrentCfg(
+        self.experiment_name = "unitree_g1_rough_mlp"
+        self.policy = RslRlPpoActorCriticCfg(
             init_noise_std=1.0,
-            actor_hidden_dims=[512, 256, 128],
-            critic_hidden_dims=[512, 256, 128],
+            actor_hidden_dims=[1024, 512, 256],
+            critic_hidden_dims=[1024, 512, 256],
             activation="elu",
             actor_obs_normalization=True,
             critic_obs_normalization=True,
-            rnn_type="gru",
-            rnn_hidden_dim=512,
-            rnn_num_layers=1,
         )

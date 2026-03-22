@@ -125,3 +125,148 @@ def randomize_joint_default_pos(
         asset.data.default_joint_pos[env_ids, joint_ids] = pos
         # update the offset in action since it is not updated automatically
         env.action_manager.get_term("joint_pos")._offset[env_ids, joint_ids] = pos
+
+
+# =============================================================================
+# Domain randomization: joint friction and motor Kt (aligned with bfm_training)
+# =============================================================================
+
+from isaaclab.managers.manager_base import ManagerTermBase
+from isaaclab.managers.manager_term_cfg import EventTermCfg
+from isaaclab.actuators import ImplicitActuator
+
+
+class randomize_actuator_gains_coupled(ManagerTermBase):
+    """Randomize stiffness and damping with a shared factor per joint (motor Kt model).
+
+    Unlike independent randomization, this applies the same random scale to
+    both Kp and Kd, modeling motor torque constant variations.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env):
+        super().__init__(cfg, env)
+        self.asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self.asset: Articulation = env.scene[self.asset_cfg.name]
+
+    def __call__(
+        self, env, env_ids: torch.Tensor | None,
+        asset_cfg: SceneEntityCfg,
+        distribution_params: tuple[float, float] = (0.875, 1.075),
+        operation: str = "scale",
+        distribution: str = "uniform",
+    ):
+        if env_ids is None:
+            env_ids = torch.arange(env.scene.num_envs, device=self.asset.device)
+
+        for actuator in self.asset.actuators.values():
+            if isinstance(self.asset_cfg.joint_ids, slice):
+                act_indices = slice(None)
+                global_indices = actuator.joint_indices if not isinstance(actuator.joint_indices, slice) else slice(None)
+            else:
+                asset_jids = torch.tensor(self.asset_cfg.joint_ids, device=self.asset.device)
+                act_jids = actuator.joint_indices
+                if isinstance(act_jids, slice):
+                    act_indices = asset_jids
+                    global_indices = asset_jids
+                else:
+                    act_indices = torch.nonzero(torch.isin(act_jids, asset_jids)).view(-1)
+                    if len(act_indices) == 0:
+                        continue
+                    global_indices = act_jids[act_indices]
+
+            factor = math_utils.sample_uniform(
+                distribution_params[0], distribution_params[1],
+                actuator.stiffness[env_ids].shape, self.asset.device,
+            )
+
+            stiffness = actuator.stiffness[env_ids].clone()
+            stiffness[:, act_indices] = self.asset.data.default_joint_stiffness[env_ids][:, global_indices] * factor[:, act_indices]
+            actuator.stiffness[env_ids] = stiffness
+            if isinstance(actuator, ImplicitActuator):
+                self.asset.write_joint_stiffness_to_sim(stiffness, joint_ids=actuator.joint_indices, env_ids=env_ids)
+
+            damping = actuator.damping[env_ids].clone()
+            damping[:, act_indices] = self.asset.data.default_joint_damping[env_ids][:, global_indices] * factor[:, act_indices]
+            actuator.damping[env_ids] = damping
+            if isinstance(actuator, ImplicitActuator):
+                self.asset.write_joint_damping_to_sim(damping, joint_ids=actuator.joint_indices, env_ids=env_ids)
+
+
+class randomize_joint_coulomb_friction(ManagerTermBase):
+    """Randomize static and dynamic Coulomb friction coefficients of joints.
+
+    Uses IsaacLab's write_joint_friction_coefficient_to_sim API.
+    Ensures dynamic friction does not exceed static friction.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env):
+        super().__init__(cfg, env)
+        self.asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self.asset: Articulation = env.scene[self.asset_cfg.name]
+
+    def __call__(
+        self, env, env_ids: torch.Tensor | None,
+        asset_cfg: SceneEntityCfg,
+        static_friction_range: tuple[float, float] = (0.7, 1.3),
+        dynamic_friction_range: tuple[float, float] = (0.7, 1.3),
+        operation: str = "scale",
+    ):
+        if env_ids is None:
+            env_ids = torch.arange(env.scene.num_envs, device=self.asset.device)
+
+        joint_ids = self.asset_cfg.joint_ids if self.asset_cfg.joint_ids != slice(None) else slice(None)
+
+        static_coeff = self.asset.data.default_joint_friction_coeff.clone()
+        static_coeff = _randomize_prop_by_op(
+            static_coeff, static_friction_range, env_ids, joint_ids, operation=operation,
+        )
+        static_coeff = torch.clamp(static_coeff, min=0.0)
+
+        dynamic_coeff = self.asset.data.default_joint_friction_coeff.clone() * 0.5
+        dynamic_coeff = _randomize_prop_by_op(
+            dynamic_coeff, dynamic_friction_range, env_ids, joint_ids, operation=operation,
+        )
+        dynamic_coeff = torch.clamp(dynamic_coeff, min=0.0)
+        dynamic_coeff = torch.minimum(dynamic_coeff, static_coeff)
+
+        env_slice = env_ids[:, None] if isinstance(joint_ids, torch.Tensor) else env_ids
+        self.asset.write_joint_friction_coefficient_to_sim(
+            joint_friction_coeff=static_coeff[env_slice, joint_ids],
+            joint_dynamic_friction_coeff=dynamic_coeff[env_slice, joint_ids],
+            joint_ids=joint_ids,
+            env_ids=env_ids,
+        )
+
+
+class randomize_joint_viscous_friction(ManagerTermBase):
+    """Randomize viscous friction coefficient of joints (velocity-proportional resistance)."""
+
+    def __init__(self, cfg: EventTermCfg, env):
+        super().__init__(cfg, env)
+        self.asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self.asset: Articulation = env.scene[self.asset_cfg.name]
+
+    def __call__(
+        self, env, env_ids: torch.Tensor | None,
+        asset_cfg: SceneEntityCfg,
+        viscous_friction_range: tuple[float, float] = (0.0, 0.05),
+        operation: str = "add",
+    ):
+        if env_ids is None:
+            env_ids = torch.arange(env.scene.num_envs, device=self.asset.device)
+
+        joint_ids = self.asset_cfg.joint_ids if self.asset_cfg.joint_ids != slice(None) else slice(None)
+
+        viscous = torch.zeros_like(self.asset.data.default_joint_friction_coeff)
+        viscous = _randomize_prop_by_op(
+            viscous, viscous_friction_range, env_ids, joint_ids, operation=operation,
+        )
+        viscous = torch.clamp(viscous, min=0.0)
+
+        env_slice = env_ids[:, None] if isinstance(joint_ids, torch.Tensor) else env_ids
+        self.asset.write_joint_friction_coefficient_to_sim(
+            joint_friction_coeff=self.asset.data.joint_friction_coeff[env_slice, joint_ids],
+            joint_viscous_friction_coeff=viscous[env_slice, joint_ids],
+            joint_ids=joint_ids,
+            env_ids=env_ids,
+        )

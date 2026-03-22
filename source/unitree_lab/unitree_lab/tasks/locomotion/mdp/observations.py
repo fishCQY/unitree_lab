@@ -396,6 +396,66 @@ def depth_scan(
 
 
 # =============================================================================
+# Critic temporal observations (privileged information)
+# =============================================================================
+
+
+def episode_time_remaining(env: ManagerBasedEnv) -> torch.Tensor:
+    """Fraction of episode time remaining. Shape: (num_envs, 1)."""
+    current_time = env.episode_length_buf * env.step_dt
+    max_time = env.max_episode_length_s
+    return ((max_time - current_time) / max_time).unsqueeze(1)
+
+
+def time_until_next_resample(
+    env: ManagerBasedRLEnv, command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """Normalized time until next command resample. Shape: (num_envs, 1)."""
+    vel_cmd = env.command_manager._terms.get(command_name)
+    if vel_cmd is None:
+        return torch.zeros((env.num_envs, 1), device=env.device)
+    time_left = vel_cmd.time_left
+    max_resample = vel_cmd.cfg.resampling_time_range[1]
+    return (time_left / max(max_resample, 1e-6)).unsqueeze(1)
+
+
+def time_until_next_push(
+    env: ManagerBasedEnv, time_scale: float = 0.2,
+) -> torch.Tensor:
+    """Scaled time until next push event. Shape: (num_envs, 1)."""
+    event_mgr = env.event_manager
+    try:
+        mode_names = event_mgr._mode_term_names.get("interval", [])
+        push_idx = mode_names.index("push_robot") if "push_robot" in mode_names else None
+    except (AttributeError, ValueError):
+        push_idx = None
+
+    if push_idx is None:
+        for attr_name in ["base_external_force_torque"]:
+            try:
+                idx = mode_names.index(attr_name)
+                push_idx = idx
+                break
+            except (ValueError, UnboundLocalError):
+                pass
+
+    if push_idx is None:
+        return torch.zeros(env.num_envs, 1, device=env.device)
+
+    time_left = event_mgr._interval_term_time_left[push_idx]
+    return (time_left * time_scale).unsqueeze(1)
+
+
+def robot_mass_obs(
+    env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Total robot mass as observation. Shape: (num_envs, 1)."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    masses = asset.root_physx_view.get_masses()
+    return masses.sum(dim=1, keepdim=True).to(env.device)
+
+
+# =============================================================================
 # AMP Plugin observation terms (single-step, for use with AMPPlugin)
 # =============================================================================
 

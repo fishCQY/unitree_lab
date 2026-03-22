@@ -33,6 +33,7 @@ from pathlib import Path
 
 from rsl_rl.env import VecEnv
 from rsl_rl.plugins import AMPPlugin
+from rsl_rl.plugins.symmetry import SymmetryClassifier
 from rsl_rl.runners import OnPolicyRunner
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,13 @@ class AMPPluginRunner(OnPolicyRunner):
 
             # Load offline motion data
             self._load_amp_offline_data()
+
+        # Construct SymmetryClassifier if configured
+        self._sym_cfg = train_cfg.get("symmetry_classifier")
+        self.symmetry_classifier: SymmetryClassifier | None = None
+        if self._sym_cfg is not None:
+            obs = self.env.get_observations().to(self.device)
+            self.symmetry_classifier = self._construct_symmetry_classifier(obs, self._sym_cfg)
 
         # AMP logging buffers
         self._style_rewbuffer = deque(maxlen=100)
@@ -129,6 +137,29 @@ class AMPPluginRunner(OnPolicyRunner):
         print("[AMPPluginRunner] Warning: No offline data configured for AMP. "
               "Set 'motion_files', 'data_loader_func', or implement env.cfg.load_amp_data().")
 
+    def _construct_symmetry_classifier(self, obs, sym_cfg: dict) -> SymmetryClassifier:
+        """Construct SymmetryClassifier from config."""
+        cfg = sym_cfg.copy()
+        mirror_func_path = cfg.pop("mirror_obs_func", "cfg.mirror_obs")
+
+        if ":" in mirror_func_path:
+            import importlib
+            module_path, func_name = mirror_func_path.split(":")
+            module = importlib.import_module(module_path)
+            mirror_obs_func = getattr(module, func_name)
+        else:
+            obj = self.env
+            for attr in mirror_func_path.split("."):
+                obj = getattr(obj, attr)
+            mirror_obs_func = obj
+
+        return SymmetryClassifier(
+            obs_dict=obs,
+            mirror_obs_func=mirror_obs_func,
+            device=self.device,
+            **cfg,
+        )
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint(
@@ -160,13 +191,20 @@ class AMPPluginRunner(OnPolicyRunner):
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     obs, rewards, dones = obs.to(self.device), rewards.to(self.device), dones.to(self.device)
 
-                    # AMP reward (reward() uses no_grad internally)
+                    # AMP style reward
+                    additional_reward = torch.zeros_like(rewards)
                     if self.amp is not None:
                         style_rewards, disc_score = self.amp.reward(obs, self.alg.storage, self._step_dt)
-                        total_rewards = self.amp.combine_reward(task_reward=rewards, style_reward=style_rewards)
+                        additional_reward += style_rewards
                     else:
                         style_rewards = None
-                        total_rewards = rewards
+
+                    # SymmetryClassifier reward
+                    if self.symmetry_classifier is not None:
+                        symm_rewards = self.symmetry_classifier.reward(obs, self.alg.storage) * self._step_dt
+                        additional_reward += symm_rewards
+
+                    total_rewards = rewards + additional_reward
 
                     self.alg.process_env_step(obs, total_rewards, dones, extras)
 
@@ -186,9 +224,13 @@ class AMPPluginRunner(OnPolicyRunner):
             amp_loss_dict = {}
             if self.amp is not None:
                 amp_loss_dict = self.amp.update(self.alg.storage, self.alg.learning_rate)
+            sym_loss_dict = {}
+            if self.symmetry_classifier is not None:
+                sym_loss_dict = self.symmetry_classifier.update(self.alg.storage, self.alg.learning_rate)
 
             loss_dict = self.alg.update()
             loss_dict.update(amp_loss_dict)
+            loss_dict.update(sym_loss_dict)
 
             stop = time.time()
             learn_time = stop - start
@@ -706,6 +748,10 @@ class AMPPluginRunner(OnPolicyRunner):
                 saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
         if self.amp is not None:
             saved_dict["amp_state_dict"] = self.amp.state_dict()
+        if self.symmetry_classifier is not None:
+            saved_dict["symmetry_classifier_state_dict"] = self.symmetry_classifier.classifier.state_dict()
+            saved_dict["symmetry_classifier_normalizer_state_dict"] = self.symmetry_classifier.obs_normalizer.state_dict()
+            saved_dict["symmetry_classifier_optimizer_state_dict"] = self.symmetry_classifier.optimizer.state_dict()
         torch.save(saved_dict, path)
         self.logger.save_model(path, self.current_learning_iteration)
 
@@ -718,6 +764,15 @@ class AMPPluginRunner(OnPolicyRunner):
 
         if self.amp is not None and "amp_state_dict" in loaded_dict:
             self.amp.load_state_dict(loaded_dict["amp_state_dict"])
+
+        if self.symmetry_classifier is not None and "symmetry_classifier_state_dict" in loaded_dict:
+            try:
+                self.symmetry_classifier.classifier.load_state_dict(loaded_dict["symmetry_classifier_state_dict"])
+                self.symmetry_classifier.obs_normalizer.load_state_dict(loaded_dict["symmetry_classifier_normalizer_state_dict"])
+                if load_optimizer:
+                    self.symmetry_classifier.optimizer.load_state_dict(loaded_dict["symmetry_classifier_optimizer_state_dict"])
+            except RuntimeError as e:
+                print(f"[SymmetryClassifier] Warning: Failed to load state: {e}. Reinitializing.")
 
         if load_optimizer and resumed_training:
             if "optimizer_state_dict" in loaded_dict:
@@ -737,14 +792,18 @@ class AMPPluginRunner(OnPolicyRunner):
         super().train_mode()
         if self.amp is not None:
             self.amp.train()
+        if self.symmetry_classifier is not None:
+            self.symmetry_classifier.classifier.train()
 
     def eval_mode(self):
         super().eval_mode()
         if self.amp is not None:
             self.amp.eval()
+        if self.symmetry_classifier is not None:
+            self.symmetry_classifier.classifier.eval()
 
     def _get_default_obs_sets(self) -> list[str]:
-        """Include AMP obs groups in defaults so they get stored."""
+        """Include AMP and symmetry obs groups in defaults so they get stored."""
         defaults = super()._get_default_obs_sets()
         if self._amp_cfg is not None:
             obs_group = self._amp_cfg.get("obs_group", "amp")
@@ -753,4 +812,8 @@ class AMPPluginRunner(OnPolicyRunner):
             cond_group = self._amp_cfg.get("condition_obs_group")
             if cond_group is not None and cond_group not in defaults:
                 defaults.append(cond_group)
+        if self._sym_cfg is not None:
+            sym_group = self._sym_cfg.get("obs_group", "symmetry")
+            if sym_group not in defaults:
+                defaults.append(sym_group)
         return defaults

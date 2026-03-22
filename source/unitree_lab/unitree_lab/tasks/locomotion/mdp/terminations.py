@@ -23,6 +23,51 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+def bad_orientation_stochastic(
+    env: ManagerBasedRLEnv,
+    limit_angle: float,
+    probability: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Probabilistic termination when orientation exceeds limit.
+
+    Instead of always terminating on bad orientation, only terminates with
+    a given probability, allowing the policy to learn recovery behaviors.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    bad_orientation = torch.acos(-asset.data.projected_gravity_b[:, 2]).abs() > limit_angle
+    random_values = torch.rand(bad_orientation.shape, device=bad_orientation.device)
+    return bad_orientation & (random_values < probability)
+
+
+class illegal_contact_with_immune(ManagerTermBase):
+    """Terminate on illegal contact with random immunity.
+
+    A fraction of environments are randomly made immune to contact
+    termination, giving the policy a chance to learn recovery from falls.
+    Immunity is resampled at regular intervals.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.immune_probability = cfg.params["immune_probability"]
+        self.immune_ids = torch.rand(env.num_envs, device=env.device) < self.immune_probability
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        threshold: float,
+        immune_probability: float,
+        resample_interval: int,
+        sensor_cfg: SceneEntityCfg,
+    ) -> torch.Tensor:
+        env_ids = env.episode_length_buf % resample_interval == 0
+        if env_ids.any():
+            self.immune_ids[env_ids] = torch.rand(env_ids.sum(), device=env.device) < self.immune_probability
+        illegal_contact = mdp.illegal_contact(env, threshold, sensor_cfg)
+        return illegal_contact & ~self.immune_ids
+
+
 def terrain_out_of_bounds(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

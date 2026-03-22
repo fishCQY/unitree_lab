@@ -177,6 +177,7 @@ class G1ObservationsCfg:
 
     @configclass
     class CriticCfg(ObsGroup):
+        """Privileged critic observations (asymmetric actor-critic)."""
         base_ang_vel = ObsTerm(func=mdp.imu_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
         projected_gravity = ObsTerm(func=mdp.imu_projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
@@ -184,6 +185,11 @@ class G1ObservationsCfg:
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
         actions = ObsTerm(func=mdp.last_action)
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
+        height_scan = ObsTerm(
+            func=mdp.height_scan,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            noise=Unoise(n_min=-0.1, n_max=0.1), clip=(-1.0, 1.0),
+        )
         joint_torques = ObsTerm(func=mdp.joint_torques)
         joint_accs = ObsTerm(func=mdp.joint_accs)
         feet_lin_vel = ObsTerm(func=mdp.feet_lin_vel, params={"asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*")})
@@ -191,13 +197,13 @@ class G1ObservationsCfg:
         base_mass_rel = ObsTerm(func=mdp.rigid_body_masses, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
         rigid_body_material = ObsTerm(func=mdp.rigid_body_material, params={"asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*")})
         base_com = ObsTerm(func=mdp.base_com, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
-        action_delay_legs = ObsTerm(func=mdp.action_delay, params={"actuators_names": "legs"})
-        action_delay_feet = ObsTerm(func=mdp.action_delay, params={"actuators_names": "feet"})
-        action_delay_shoulders = ObsTerm(func=mdp.action_delay, params={"actuators_names": "shoulders"})
-        action_delay_arms = ObsTerm(func=mdp.action_delay, params={"actuators_names": "arms"})
-        action_delay_wrist = ObsTerm(func=mdp.action_delay, params={"actuators_names": "wrist"})
         push_force = ObsTerm(func=mdp.push_force, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
         push_torque = ObsTerm(func=mdp.push_torque, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
+        # Temporal information (aligned with bfm_training)
+        episode_time_remaining = ObsTerm(func=mdp.episode_time_remaining)
+        time_until_next_resample = ObsTerm(func=mdp.time_until_next_resample, params={"command_name": "base_velocity"})
+        time_until_next_push = ObsTerm(func=mdp.time_until_next_push)
+        robot_mass = ObsTerm(func=mdp.robot_mass_obs, params={"asset_cfg": SceneEntityCfg("robot")})
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -226,14 +232,23 @@ class G1ObservationsCfg:
     class AmpCfg(ObsGroup):
         """Single-step AMP features for AMPPlugin (2D output).
 
-        Must match the offline data keys exactly:
-          dof_pos(29) + dof_vel(29) + root_angle_vel(3) + proj_grav(3) = 64 dim/frame.
-        The AMPPlugin builds multi-frame sequences internally from rollout storage.
+        Must match offline data keys:
+          dof_pos(29) + dof_vel(29) + root_angle_vel(3) + proj_grav(3) + key_points_b(4*3=12) = 76 dim/frame.
+        Run scripts/add_key_points_to_amp_pkl.py to add key_points_b to PKL data.
         """
         joint_pos = ObsTerm(func=mdp.amp_joint_pos, params={"asset_cfg": SceneEntityCfg("robot")})
         joint_vel = ObsTerm(func=mdp.amp_joint_vel, params={"asset_cfg": SceneEntityCfg("robot")})
         base_ang_vel = ObsTerm(func=mdp.amp_base_ang_vel, params={"asset_cfg": SceneEntityCfg("robot")})
         projected_gravity = ObsTerm(func=mdp.amp_projected_gravity, params={"asset_cfg": SceneEntityCfg("robot")})
+        body_pos_b = ObsTerm(
+            func=mdp.amp_body_pos_b,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=[
+                    "left_knee_link", "right_knee_link",
+                    "left_shoulder_yaw_link", "right_shoulder_yaw_link",
+                ]),
+            },
+        )
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -255,6 +270,20 @@ class G1ObservationsCfg:
             self.enable_corruption = False
             self.concatenate_terms = True
 
+    @configclass
+    class SymmetryCfg(ObsGroup):
+        """Observations for SymmetryClassifier (same layout as keys used by mirror_obs)."""
+        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+        joint_pos = ObsTerm(func=mdp.joint_pos)
+        joint_vel = ObsTerm(func=mdp.joint_vel)
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
     guidance: PolicyCfg = PolicyCfg()
@@ -262,6 +291,7 @@ class G1ObservationsCfg:
     image: ImageCfg = ImageCfg()
     amp: AmpCfg = AmpCfg()
     amp_condition: AmpConditionCfg = AmpConditionCfg()
+    symmetry: SymmetryCfg = SymmetryCfg()
 
 
 @configclass
@@ -273,52 +303,50 @@ class G1EventCfg:
     scale_actuator_gains = EventTerm(func=mdp.randomize_actuator_gains, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint"), "stiffness_distribution_params": (0.8, 1.2), "damping_distribution_params": (0.8, 1.2), "operation": "scale"})
     scale_joint_armature = EventTerm(func=mdp.randomize_joint_parameters, mode="startup", params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint"), "armature_distribution_params": (0.75, 1.25), "operation": "scale"})
     reset_base = EventTerm(func=mdp.reset_root_state_uniform, mode="reset", params={"pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)}, "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "z": (-0.5, 0.5), "roll": (-0.5, 0.5), "pitch": (-0.5, 0.5), "yaw": (-0.5, 0.5)}})
-    reset_robot_joints = EventTerm(func=mdp.reset_joints_by_scale, mode="reset", params={"position_range": (0.5, 1.5), "velocity_range": (0.0, 0.0)})
-    base_external_force_torque = EventTerm(func=mdp.apply_external_force_torque_stochastic, mode="interval", interval_range_s=(3.7, 4.2), params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link"), "force_range": {"x": (-200.0, 200.0), "y": (-200.0, 200.0), "z": (-100.0, 100.0)}, "torque_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)}, "probability": 1.0})
+    reset_robot_joints = EventTerm(func=mdp.reset_joints_by_offset, mode="reset", params={"position_range": (-0.1, 0.1), "velocity_range": (-1.0, 1.0)})
+    # Periodic re-randomization (aligned with bfm_training, every ~50k steps)
+    joint_motor_Kt = EventTerm(func=mdp.randomize_actuator_gains_coupled, min_step_count_between_reset=50000, mode="reset", params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint"), "distribution_params": (0.875, 1.075), "operation": "scale"})
+    joint_coulomb_friction = EventTerm(func=mdp.randomize_joint_coulomb_friction, min_step_count_between_reset=50000, mode="reset", params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint"), "static_friction_range": (0.7, 1.3), "dynamic_friction_range": (0.7, 1.3), "operation": "scale"})
+    joint_viscous_friction = EventTerm(func=mdp.randomize_joint_viscous_friction, min_step_count_between_reset=50000, mode="reset", params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint"), "viscous_friction_range": (0.0, 0.05), "operation": "add"})
+    push_robot = EventTerm(func=mdp.push_by_setting_velocity, mode="interval", interval_range_s=(3.7, 4.2), params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}})
 
 
 @configclass
 class G1RewardsCfg:
-    # --- Core tracking rewards (aligned with bfm_training) ---
+    """Reward configuration aligned with bfm_training."""
+    # --- Core tracking rewards ---
     track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=2.5, params={"command_name": "base_velocity", "std": math.sqrt(0.15)})
     track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_world_exp, weight=1.5, params={"command_name": "base_velocity", "std": math.sqrt(0.5)})
-    # --- Core penalties (aligned with bfm_training) ---
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.1)
-    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-1.0)
+    orientation = RewTerm(func=mdp.orientation_mixed, weight=1.0)
+    # --- Penalties ---
+    action_rate = RewTerm(func=mdp.action_rate_l2_clipped, weight=-0.1, params={"max_val": 5.0})
+    dof_pos_limits = RewTerm(func=mdp.dof_pos_near_limits, weight=-1.0, params={"threshold": 0.1, "asset_cfg": SceneEntityCfg("robot")})
     undesired_contacts = RewTerm(func=mdp.undesired_contacts, weight=-2.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="(?!.*ankle.*).*"), "threshold": 1.0})
-    # --- Regularization rewards (cooperate with AMP style reward) ---
-    feet_air_time = RewTerm(func=mdp.feet_air_time_positive_biped, weight=0.3, params={"command_name": "base_velocity", "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "threshold": 0.25})
-    feet_slide = RewTerm(func=mdp.feet_slide, weight=-0.1, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll.*")})
-    joint_deviation_hip = RewTerm(func=mdp.joint_deviation_l1, weight=-0.1, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_yaw.*", ".*_hip_roll.*", ".*_shoulder_pitch.*", ".*_elbow.*"])})
-    joint_deviation_arms = RewTerm(func=mdp.joint_deviation_l1, weight=-0.1, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*waist.*", ".*_shoulder_roll.*", ".*_shoulder_yaw.*", ".*_wrist.*"])})
-    joint_deviation_legs = RewTerm(func=mdp.joint_deviation_l1, weight=-0.05, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_pitch.*", ".*_knee.*", ".*_ankle.*"])})
-    # --- Retained but disabled ---
-    lin_vel_z_l2 = RewTerm(func=mdp.body_lin_vel_z_l2, weight=0.0, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
-    ang_vel_xy_l2 = RewTerm(func=mdp.body_ang_vel_xy_l2, weight=0.0, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")})
-    energy = RewTerm(func=mdp.energy, weight=0.0)
-    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=0.0)
-    fly = RewTerm(func=mdp.fly, weight=0.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "threshold": 1.0})
-    body_orientation_l2 = RewTerm(func=mdp.body_orientation_l2, params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")}, weight=0.0)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=0.0)
-    termination_penalty = RewTerm(func=mdp.is_terminated, weight=0.0)
-    feet_force = RewTerm(func=mdp.body_force, weight=0.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"), "threshold": 500, "max_reward": 400})
-    feet_too_near = RewTerm(func=mdp.feet_too_near_humanoid, weight=0.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=[".*ankle_roll.*"]), "threshold": 0.2})
-    feet_stumble = RewTerm(func=mdp.feet_stumble, weight=0.0, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=[".*ankle_roll.*"])})
 
 
 @configclass
 class G1TerminationsCfg:
+    """Termination with probabilistic immunity (aligned with bfm_training)."""
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    base_contact = DoneTerm(func=mdp.illegal_contact, params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="torso_link"), "threshold": 1.0})
+    base_contact = DoneTerm(
+        func=mdp.illegal_contact_with_immune,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names="torso_link"),
+            "threshold": 1.0,
+            "immune_probability": 0.1,
+            "resample_interval": 200,
+        },
+    )
+    bad_orientation = DoneTerm(
+        func=mdp.bad_orientation_stochastic,
+        params={"limit_angle": math.pi * 0.25, "probability": 0.01},
+    )
 
 
 @configclass
 class G1CurriculumCfg:
+    """Terrain curriculum only; no velocity command curriculum (bfm_training style)."""
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
-    ang_vel_levels = CurrTerm(
-        func=mdp.ang_vel_curriculum,
-        params={"delta": 0.1, "max_ang_vel": 2.0},
-    )
 
 
 # =============================================================================
@@ -341,28 +369,23 @@ class UnitreeG1RoughEnvCfg(LocomotionEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.robot = UNITREE_G1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        self.episode_length_s = 10.0
+        self.episode_length_s = 20.0
         self.actions.joint_pos.scale = 0.25
         self.actions.joint_pos.clip = {".*": [-100.0, 100]}
         self.observations.policy.height_scan = None
-        self.scene.height_scanner = None
-        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        # Commands: full range from start (no velocity curriculum)
+        self.commands.base_velocity.ranges.ang_vel_z = (-2.0, 2.0)
         self.commands.base_velocity.resampling_time_range = (4.0, 6.0)
         self.commands.base_velocity.rel_standing_envs = 0.1
+        self.commands.base_velocity.terrain_velocity_ranges = {
+            "plane": ((-1.5, 2.0), (-0.6, 0.6), (-2.0, 2.0)),
+        }
         self.observations.debug = None
         self.observations.image = None
 
-    def load_amp_data(self):
-        """Load conditional LAFAN AMP data for the AMPPlugin discriminator.
-
-        Returns walk/run condition labels matching the AmpConditionCfg
-        (vx_threshold=1.1 → condition 0=walk, 1=run).
-        """
-        from unitree_lab.utils.amp_data_loader import (
-            load_conditional_amp_data,
-            create_mirror_config,
-        )
-
+    def _get_mirror_config(self):
+        """Get G1 29dof mirror indices and signs."""
+        from unitree_lab.utils.amp_data_loader import create_mirror_config
         all_joint_names = [
             "left_hip_yaw_joint", "left_hip_roll_joint", "left_hip_pitch_joint",
             "left_knee_joint", "right_hip_yaw_joint", "right_hip_roll_joint",
@@ -377,9 +400,28 @@ class UnitreeG1RoughEnvCfg(LocomotionEnvCfg):
             "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
             "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
         ]
-        mirror_indices, mirror_signs = create_mirror_config(
-            _G1_LEFT_JOINTS, _G1_RIGHT_JOINTS, all_joint_names,
+        return create_mirror_config(_G1_LEFT_JOINTS, _G1_RIGHT_JOINTS, all_joint_names)
+
+    def mirror_obs(self, obs):
+        """Mirror symmetry observation for SymmetryClassifier.
+
+        Called by AMPPluginRunner._construct_symmetry_classifier via
+        mirror_obs_func="cfg.mirror_obs".
+        """
+        from unitree_lab.utils.mirror_utils import mirror_obs_by_keys
+        mirror_indices, mirror_signs = self._get_mirror_config()
+        return mirror_obs_by_keys(
+            obs,
+            keys=["velocity_commands", "dof_pos", "dof_vel", "base_lin_vel", "base_ang_vel", "projected_gravity"],
+            joint_mirror_indices=mirror_indices,
+            joint_mirror_signs=mirror_signs,
         )
+
+    def load_amp_data(self):
+        """Load conditional LAFAN AMP data for the AMPPlugin discriminator."""
+        from unitree_lab.utils.amp_data_loader import load_conditional_amp_data
+
+        mirror_indices, mirror_signs = self._get_mirror_config()
 
         amp_conditions = {
             "walk": [str(_AMP_DATA_DIR / "lafan_walk_clips.pkl")],
@@ -387,7 +429,7 @@ class UnitreeG1RoughEnvCfg(LocomotionEnvCfg):
         }
         return load_conditional_amp_data(
             amp_conditions,
-            keys=["dof_pos", "dof_vel", "root_angle_vel", "proj_grav"],
+            keys=["dof_pos", "dof_vel", "root_angle_vel", "proj_grav", "key_points_b"],
             device=self.sim.device,
             mirror=True,
             joint_mirror_indices=mirror_indices,
@@ -409,7 +451,7 @@ class UnitreeG1RoughEnvCfg_PLAY(UnitreeG1RoughEnvCfg):
             self.scene.terrain.terrain_generator.num_cols = 5
             self.scene.terrain.terrain_generator.curriculum = False
         self.observations.policy.enable_corruption = False
-        self.events.base_external_force_torque = None
+        self.events.push_robot = None
         self.commands.base_velocity.ranges.lin_vel_x = (-2.0, 2.0)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-2.0, 2.0)

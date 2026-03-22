@@ -512,6 +512,35 @@ class select_undesired_contacts(ManagerTermBase):
         return torch.sum(is_contact, dim=1)
 
 
+def orientation_mixed(
+    env: ManagerBasedRLEnv, l2_sigma: float = 2.0, l1_sigma: float = 1.0, l1_weight: float = 0.1,
+) -> torch.Tensor:
+    """Reward for maintaining upright orientation (roll/pitch near zero)."""
+    asset: Articulation = env.scene["robot"]
+    projected_gravity_b = asset.data.projected_gravity_b[:, :2]
+    l2_reward = torch.exp(-l2_sigma * torch.norm(projected_gravity_b, dim=1) ** 2)
+    l1_reward = torch.exp(-l1_sigma * torch.norm(projected_gravity_b, dim=1))
+    return l2_reward + l1_weight * l1_reward
+
+
+def action_rate_l2_clipped(env: ManagerBasedRLEnv, max_val: float = 5.0) -> torch.Tensor:
+    """Action rate L2 penalty with per-joint clipping to avoid exploding gradients."""
+    rate_sq = torch.square(env.action_manager.action - env.action_manager.prev_action)
+    return torch.sum(rate_sq.clamp(max=max_val ** 2), dim=1)
+
+
+def dof_pos_near_limits(
+    env: ManagerBasedRLEnv, threshold: float = 0.1, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize joint positions that are within threshold of their limits."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    limits = asset.data.joint_pos_limits[:, asset_cfg.joint_ids]
+    near_lower = (joint_pos - limits[:, :, 0]) < threshold
+    near_upper = (limits[:, :, 1] - joint_pos) < threshold
+    return torch.sum(near_lower | near_upper, dim=1).float()
+
+
 def joint_deviation_l1_without_command(
     env: ManagerBasedRLEnv, command_name: str,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

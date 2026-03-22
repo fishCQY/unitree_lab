@@ -5,7 +5,7 @@ from .rsl_rl_ppo_cfg import (
     AMPPluginCfg,
     UnitreeG1RoughPluginRunnerCfg,
     UnitreeG1FlatPluginRunnerCfg,
-    UnitreeG1RoughPluginGRURunnerCfg,
+    UnitreeG1RoughMLPRunnerCfg,
 )
 
 __all__ = [
@@ -13,5 +13,5 @@ __all__ = [
     "AMPPluginCfg",
     "UnitreeG1RoughPluginRunnerCfg",
     "UnitreeG1FlatPluginRunnerCfg",
-    "UnitreeG1RoughPluginGRURunnerCfg",
+    "UnitreeG1RoughMLPRunnerCfg",
 ]
