@@ -256,7 +256,12 @@ class AMPPluginRunner(OnPolicyRunner):
             logger.warning(f"[Sim2Sim] Failed at iter {iteration}: {e}")
 
     def _run_sim2sim(self, iteration: int) -> None:
-        """Export ONNX, run MuJoCo eval, record video, upload to W&B."""
+        """Two-phase sim2sim evaluation (bfm_training style).
+
+        Phase 1: Run all eval tasks headless (no rendering) to collect metrics.
+        Phase 2: Record videos for mixed_terrain + worst-performing tasks.
+        Upload structured metrics + videos to W&B.
+        """
         cfg = self.sim2sim_cfg
         log_dir = self.logger.log_dir
 
@@ -270,61 +275,214 @@ class AMPPluginRunner(OnPolicyRunner):
         # 2. Build deploy.yaml
         deploy_yaml_path = self._build_deploy_yaml(export_dir, iteration)
 
-        # 3. Run sim2sim in-process with EGL
+        # 3. Setup imports and environment
         os.environ["MUJOCO_GL"] = "egl"
 
-        task_name = cfg.get("task", "rough_forward")
         duration = cfg.get("duration", 20.0)
-        robot = cfg.get("robot", "g1")
-        velocity = cfg.get("velocity", (1.0, 0.0, 0.0))
-        xml_path = cfg.get("xml_path")
+        num_worst_videos = cfg.get("num_worst_videos", 2)
+        xml_path_cfg = cfg.get("xml_path")
+        eval_tasks = cfg.get("eval_tasks", [
+            "flat_forward", "flat_fast", "rough_forward",
+            "stairs_up", "stairs_down", "slope_up",
+        ])
 
         out_dir = os.path.join(log_dir, "sim2sim", f"iter_{iteration}")
         os.makedirs(out_dir, exist_ok=True)
 
         try:
-            sim2sim_script_dir = Path(__file__).resolve().parents[1] / "scripts" / "mujoco_eval"
+            workspace_root = Path(__file__).resolve().parents[2]
             import sys as _sys
-            if str(sim2sim_script_dir.parent.parent) not in _sys.path:
-                _sys.path.insert(0, str(sim2sim_script_dir.parent.parent))
+            import numpy as np
+            for _p in [str(workspace_root), str(workspace_root / "source" / "unitree_lab")]:
+                if _p not in _sys.path:
+                    _sys.path.insert(0, _p)
+            _script_dir = str(workspace_root / "scripts" / "mujoco_eval")
+            if _script_dir not in _sys.path:
+                _sys.path.insert(0, _script_dir)
 
             from unitree_lab.mujoco_utils.evaluation.eval_task import get_eval_task
+            from unitree_lab.mujoco_utils.evaluation.metrics import compute_locomotion_metrics
             from unitree_lab.mujoco_utils.simulation.base_simulator import BaseMujocoSimulator
-
-            task = get_eval_task(task_name)
-            policy_dt = 0.02
-            max_steps = int(duration / policy_dt)
+            from run_sim2sim_locomotion import _generate_course_xml, _setup_terrain
 
             config_override = {}
             if deploy_yaml_path and os.path.isfile(deploy_yaml_path):
                 config_override = self._load_deploy_override(deploy_yaml_path)
 
-            if xml_path is None:
-                _, xml_path = self._find_sim2sim_xml(task_name)
-            if xml_path is None:
-                logger.warning("[Sim2Sim] No XML found, skipping.")
-                return
+            # ---- Phase 1: Headless evaluation of all tasks (no rendering) ----
+            print(f"[Sim2Sim] Phase 1: evaluating {len(eval_tasks)} tasks (it={iteration})...")
+            task_results: dict[str, dict] = {}
+            policy_dt = 0.02
 
-            simulator = BaseMujocoSimulator(
-                xml_path=str(xml_path),
-                onnx_path=str(onnx_path),
-                config_override=config_override if config_override else None,
-            )
+            for task_name in eval_tasks:
+                try:
+                    task = get_eval_task(task_name)
+                    simulator, tmp_xml = self._create_simulator_with_terrain(
+                        task, onnx_path, xml_path_cfg, config_override,
+                        _generate_course_xml, _setup_terrain,
+                    )
 
-            video_path = self._record_sim2sim_video(
-                simulator, task, out_dir, max_steps, velocity=velocity,
-            )
+                    vel_cmd = task.velocity_command
+                    episodes = []
+                    for _ in range(task.num_episodes):
+                        ep = simulator.run_episode(
+                            max_steps=task.max_episode_steps,
+                            render=False,
+                            velocity_command=vel_cmd,
+                        )
+                        episodes.append(ep)
 
-            if video_path and os.path.isfile(video_path):
-                self._log_sim2sim_to_wandb(video_path, iteration)
-                print(f"[Sim2Sim] Video uploaded (it={iteration}): {video_path}")
-            else:
-                logger.warning(f"[Sim2Sim] No video produced at iter {iteration}")
+                    metrics = compute_locomotion_metrics(episodes, np.array(vel_cmd), policy_dt)
+                    task_results[task_name] = {
+                        "survival_rate": metrics.survival_rate,
+                        "mean_velocity_error": metrics.mean_velocity_error,
+                        "mean_forward_distance": metrics.mean_forward_distance,
+                        "velocity_error_x": metrics.velocity_error_x,
+                        "velocity_error_y": metrics.velocity_error_y,
+                        "metrics": metrics,
+                    }
+                    print(f"  {task_name}: survival={metrics.survival_rate:.0f}%, "
+                          f"vel_err={metrics.mean_velocity_error:.3f}")
+
+                    self._cleanup_tmp_xml(tmp_xml)
+
+                except Exception as e:
+                    logger.warning(f"[Sim2Sim] Phase 1 failed for {task_name}: {e}")
+
+            # ---- Phase 2: Record videos for selected tasks ----
+            video_tasks = self._select_video_tasks(task_results, num_worst_videos)
+            max_steps = int(duration / policy_dt)
+            videos: dict[str, str] = {}
+
+            print(f"[Sim2Sim] Phase 2: recording {len(video_tasks)} videos...")
+            for video_label, task_name in video_tasks:
+                try:
+                    task = get_eval_task(task_name)
+                    simulator, tmp_xml = self._create_simulator_with_terrain(
+                        task, onnx_path, xml_path_cfg, config_override,
+                        _generate_course_xml, _setup_terrain,
+                    )
+
+                    video_path = self._record_sim2sim_video(
+                        simulator, task, out_dir, max_steps, velocity=task.velocity_command,
+                    )
+                    if video_path and os.path.isfile(video_path):
+                        videos[video_label] = video_path
+                        print(f"  {video_label} ({task_name}): {video_path}")
+
+                    self._cleanup_tmp_xml(tmp_xml)
+
+                except Exception as e:
+                    logger.warning(f"[Sim2Sim] Phase 2 video failed for {task_name}: {e}")
+
+            # ---- Upload to W&B ----
+            self._log_sim2sim_results_to_wandb(task_results, videos, iteration)
+            print(f"[Sim2Sim] Done (it={iteration}): {len(task_results)} tasks, {len(videos)} videos")
 
         except Exception as e:
-            logger.warning(f"[Sim2Sim] Error during eval: {e}")
+            logger.warning(f"[Sim2Sim] Error: {e}")
             import traceback
             traceback.print_exc()
+
+    def _create_simulator_with_terrain(self, task, onnx_path, xml_path_cfg,
+                                        config_override, _generate_course_xml, _setup_terrain):
+        """Create a BaseMujocoSimulator with terrain injection for the given task."""
+        from unitree_lab.mujoco_utils.simulation.base_simulator import BaseMujocoSimulator
+
+        xml_path = xml_path_cfg
+        if xml_path is None:
+            _, xml_path = self._find_sim2sim_xml(task.name)
+
+        uses_terrain = task.terrain_type != "flat"
+        xml_path_obj = Path(xml_path) if xml_path else None
+        tmp_xml = None
+
+        if xml_path_obj is None:
+            raise ValueError(f"No XML found for task {task.name}")
+
+        if uses_terrain and task.terrain_type == "course":
+            xml_path_obj, course_spawn_z = _generate_course_xml(xml_path_obj, task)
+            tmp_xml = xml_path_obj
+            uses_terrain = False
+        else:
+            course_spawn_z = 0.0
+
+        simulator = BaseMujocoSimulator(
+            xml_path=str(xml_path_obj),
+            onnx_path=str(onnx_path),
+            config_override=config_override if config_override else None,
+        )
+
+        if course_spawn_z > 0:
+            simulator.spawn_root_z_offset = course_spawn_z
+
+        if uses_terrain:
+            try:
+                spawn_z = _setup_terrain(simulator, task)
+                if spawn_z > 0:
+                    simulator.spawn_root_z_offset = spawn_z
+            except Exception as e:
+                logger.warning(f"[Sim2Sim] Terrain setup failed for {task.name}: {e}")
+
+        return simulator, tmp_xml
+
+    @staticmethod
+    def _select_video_tasks(task_results: dict, num_worst: int) -> list[tuple[str, str]]:
+        """Select tasks for video recording: rough_forward + worst N tasks."""
+        video_tasks = []
+
+        if "rough_forward" in task_results:
+            video_tasks.append(("sim2sim_video", "rough_forward"))
+
+        sorted_tasks = sorted(
+            task_results.items(),
+            key=lambda kv: (kv[1]["survival_rate"], -kv[1]["mean_velocity_error"]),
+        )
+        worst_count = 0
+        for task_name, _ in sorted_tasks:
+            if worst_count >= num_worst:
+                break
+            if task_name == "rough_forward":
+                continue
+            worst_count += 1
+            video_tasks.append((f"sim2sim_video_worst_{worst_count}", task_name))
+
+        return video_tasks
+
+    @staticmethod
+    def _cleanup_tmp_xml(tmp_xml) -> None:
+        if tmp_xml is not None:
+            try:
+                Path(tmp_xml).unlink(missing_ok=True)
+                for f in Path(tmp_xml).parent.glob("rough_ground_*.bin"):
+                    f.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _log_sim2sim_results_to_wandb(task_results: dict, videos: dict, iteration: int) -> None:
+        """Upload structured metrics + videos to W&B."""
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+
+        log_dict = {}
+        for task_name, result in task_results.items():
+            prefix = f"sim2sim_eval/{task_name}"
+            log_dict[f"{prefix}/survival_rate"] = result["survival_rate"]
+            log_dict[f"{prefix}/mean_velocity_error"] = result["mean_velocity_error"]
+            log_dict[f"{prefix}/mean_forward_distance"] = result["mean_forward_distance"]
+            log_dict[f"{prefix}/velocity_error_x"] = result["velocity_error_x"]
+            log_dict[f"{prefix}/velocity_error_y"] = result["velocity_error_y"]
+
+        for label, video_path in videos.items():
+            if os.path.isfile(video_path):
+                log_dict[label] = wandb.Video(video_path, format="mp4", caption=f"iter_{iteration}")
+
+        wandb.log(log_dict, step=int(iteration), commit=False)
 
     def _export_onnx(self, export_dir: str, iteration: int) -> str | None:
         """Export policy to ONNX format."""
@@ -525,7 +683,7 @@ class AMPPluginRunner(OnPolicyRunner):
         return str(video_file)
 
     def _find_sim2sim_xml(self, task: str = "rough_forward"):
-        rl_lab_root = Path(__file__).resolve().parents[1]
+        rl_lab_root = Path(__file__).resolve().parents[2]
         script = rl_lab_root / "scripts" / "mujoco_eval" / "run_sim2sim_locomotion.py"
         xml_dir = rl_lab_root / "source" / "unitree_lab" / "unitree_lab" / "assets" / "robots_xml" / "g1"
         terrain_tasks = {"rough_forward", "stairs_up", "stairs_down", "slope_up", "mixed_terrain"}
@@ -533,20 +691,6 @@ class AMPPluginRunner(OnPolicyRunner):
         flat_xml = xml_dir / "scene_29dof.xml"
         xml = terrain_xml if (task in terrain_tasks and terrain_xml.exists()) else flat_xml
         return (str(script) if script.exists() else None, str(xml) if xml.exists() else None)
-
-    @staticmethod
-    def _log_sim2sim_to_wandb(mp4_path: str, iteration: int) -> None:
-        try:
-            import wandb
-        except ImportError:
-            return
-        if wandb.run is None:
-            return
-        wandb.log(
-            {"sim2sim_video": wandb.Video(mp4_path, format="mp4", caption=f"iter_{iteration}")},
-            step=int(iteration),
-            commit=False,
-        )
 
     # ------------------------------------------------------------------
     # Save / Load
