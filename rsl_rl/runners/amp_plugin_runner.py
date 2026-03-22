@@ -281,10 +281,7 @@ class AMPPluginRunner(OnPolicyRunner):
         duration = cfg.get("duration", 20.0)
         num_worst_videos = cfg.get("num_worst_videos", 2)
         xml_path_cfg = cfg.get("xml_path")
-        eval_tasks = cfg.get("eval_tasks", [
-            "flat_forward", "flat_fast", "rough_forward",
-            "stairs_up", "stairs_down", "slope_up",
-        ])
+        eval_tasks = cfg.get("eval_tasks", ["rough_forward"])
 
         out_dir = os.path.join(log_dir, "sim2sim", f"iter_{iteration}")
         os.makedirs(out_dir, exist_ok=True)

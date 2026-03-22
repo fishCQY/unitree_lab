@@ -315,6 +315,10 @@ class G1TerminationsCfg:
 @configclass
 class G1CurriculumCfg:
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
+    ang_vel_levels = CurrTerm(
+        func=mdp.ang_vel_curriculum,
+        params={"delta": 0.1, "max_ang_vel": 2.0},
+    )
 
 
 # =============================================================================
@@ -342,7 +346,7 @@ class UnitreeG1RoughEnvCfg(LocomotionEnvCfg):
         self.actions.joint_pos.clip = {".*": [-100.0, 100]}
         self.observations.policy.height_scan = None
         self.scene.height_scanner = None
-        self.commands.base_velocity.ranges.ang_vel_z = (-2.0, 2.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
         self.commands.base_velocity.resampling_time_range = (4.0, 6.0)
         self.commands.base_velocity.rel_standing_envs = 0.1
         self.observations.debug = None

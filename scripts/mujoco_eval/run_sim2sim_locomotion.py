@@ -195,50 +195,53 @@ def _generate_course_xml(xml_path: Path, task: Any) -> tuple[Path, float]:
     gp.set("conaffinity", "1")
 
     # Build course along +X, origin at center.
+    # Each geom is a solid box from z=0 up to its top surface, preventing
+    # foot entrapment. A small x-overlap between adjacent segments ensures
+    # continuous contact surfaces at transitions.
     x_start = -total_len / 2.0
     cur_x = x_start
     cur_h = 0.0
     geom_idx = 0
     spawn_z = 0.5  # default
+    x_overlap = 0.02  # 2cm overlap between segments to seal gaps
 
-    for seg_type, seg_len in segments:
+    def _add_solid_box(wb_, name, cx, cz_top, half_sx, half_sy, rgba="0.4 0.45 0.5 1"):
+        """Add a box geom that extends from z=0 to cz_top."""
+        nonlocal geom_idx
+        if cz_top < 0.001:
+            return
+        bx = ET.SubElement(wb_, "geom")
+        bx.set("name", name)
+        bx.set("type", "box")
+        bx.set("size", f"{half_sx} {half_sy} {cz_top / 2}")
+        bx.set("pos", f"{cx} 0 {cz_top / 2}")
+        bx.set("friction", "1 0.005 0.0001")
+        bx.set("contype", "1")
+        bx.set("conaffinity", "1")
+        bx.set("rgba", rgba)
+        geom_idx += 1
+
+    for seg_idx, (seg_type, seg_len) in enumerate(segments):
         seg_type = seg_type.strip().lower()
 
         if seg_type in ("flat", "platform"):
-            # A solid box spanning the segment.
             if cur_h > 0.001:
-                bx = ET.SubElement(wb, "geom")
-                bx.set("name", f"course_{geom_idx}")
-                bx.set("type", "box")
-                bx.set("size", f"{seg_len / 2} {half_y} {cur_h / 2}")
-                bx.set("pos", f"{cur_x + seg_len / 2} 0 {cur_h / 2}")
-                bx.set("friction", "1 0.005 0.0001")
-                bx.set("contype", "1")
-                bx.set("conaffinity", "1")
-                bx.set("rgba", "0.35 0.45 0.55 1")
-                geom_idx += 1
+                _add_solid_box(wb, f"course_{geom_idx}",
+                               cur_x + seg_len / 2, cur_h,
+                               seg_len / 2 + x_overlap, half_y, "0.35 0.45 0.55 1")
             cur_x += seg_len
 
         elif seg_type == "slope_up":
             rise = min(seg_len * np.tan(slope_angle), platform_h - cur_h)
             rise = max(rise, 0.0)
-            # Approximate slope with many thin slices (solid boxes).
-            n_slices = max(1, int(seg_len / 0.10))  # ~10cm per slice
+            n_slices = max(1, int(seg_len / 0.10))
             slice_w = seg_len / n_slices
             for sl in range(n_slices):
                 frac = (sl + 1) / n_slices
                 top_h = cur_h + frac * rise
                 sx_pos = cur_x + sl * slice_w + slice_w / 2
-                bx = ET.SubElement(wb, "geom")
-                bx.set("name", f"course_{geom_idx}")
-                bx.set("type", "box")
-                bx.set("size", f"{slice_w / 2} {half_y} {top_h / 2}")
-                bx.set("pos", f"{sx_pos} 0 {top_h / 2}")
-                bx.set("friction", "1 0.005 0.0001")
-                bx.set("contype", "1")
-                bx.set("conaffinity", "1")
-                bx.set("rgba", "0.3 0.5 0.4 1")
-                geom_idx += 1
+                _add_solid_box(wb, f"course_{geom_idx}", sx_pos, top_h,
+                               slice_w / 2 + x_overlap / 2, half_y, "0.3 0.5 0.4 1")
             cur_h += rise
             cur_x += seg_len
 
@@ -252,16 +255,8 @@ def _generate_course_xml(xml_path: Path, task: Any) -> tuple[Path, float]:
                 top_h = cur_h - frac * drop
                 top_h = max(top_h, 0.001)
                 sx_pos = cur_x + sl * slice_w + slice_w / 2
-                bx = ET.SubElement(wb, "geom")
-                bx.set("name", f"course_{geom_idx}")
-                bx.set("type", "box")
-                bx.set("size", f"{slice_w / 2} {half_y} {top_h / 2}")
-                bx.set("pos", f"{sx_pos} 0 {top_h / 2}")
-                bx.set("friction", "1 0.005 0.0001")
-                bx.set("contype", "1")
-                bx.set("conaffinity", "1")
-                bx.set("rgba", "0.3 0.5 0.4 1")
-                geom_idx += 1
+                _add_solid_box(wb, f"course_{geom_idx}", sx_pos, top_h,
+                               slice_w / 2 + x_overlap / 2, half_y, "0.3 0.5 0.4 1")
             cur_h -= drop
             cur_h = max(cur_h, 0.0)
             cur_x += seg_len
@@ -274,16 +269,8 @@ def _generate_course_xml(xml_path: Path, task: Any) -> tuple[Path, float]:
             for s in range(n_steps):
                 sh = cur_h + (s + 1) * step_h
                 sx_pos = cur_x + s * actual_step_w + actual_step_w / 2
-                bx = ET.SubElement(wb, "geom")
-                bx.set("name", f"course_{geom_idx}")
-                bx.set("type", "box")
-                bx.set("size", f"{actual_step_w / 2} {half_y} {sh / 2}")
-                bx.set("pos", f"{sx_pos} 0 {sh / 2}")
-                bx.set("friction", "1 0.005 0.0001")
-                bx.set("contype", "1")
-                bx.set("conaffinity", "1")
-                bx.set("rgba", "0.4 0.45 0.5 1")
-                geom_idx += 1
+                _add_solid_box(wb, f"course_{geom_idx}", sx_pos, sh,
+                               actual_step_w / 2 + x_overlap, half_y, "0.4 0.45 0.5 1")
             cur_h += n_steps * step_h
             cur_x += seg_len
 
@@ -294,19 +281,10 @@ def _generate_course_xml(xml_path: Path, task: Any) -> tuple[Path, float]:
             actual_step_w = seg_len / n_steps
             for s in range(n_steps):
                 sh = cur_h - (s + 1) * step_h
-                sh = max(sh, 0.0)
+                sh = max(sh, 0.001)
                 sx_pos = cur_x + s * actual_step_w + actual_step_w / 2
-                box_h = sh if sh > 0.001 else 0.001
-                bx = ET.SubElement(wb, "geom")
-                bx.set("name", f"course_{geom_idx}")
-                bx.set("type", "box")
-                bx.set("size", f"{actual_step_w / 2} {half_y} {box_h / 2}")
-                bx.set("pos", f"{sx_pos} 0 {box_h / 2}")
-                bx.set("friction", "1 0.005 0.0001")
-                bx.set("contype", "1")
-                bx.set("conaffinity", "1")
-                bx.set("rgba", "0.4 0.45 0.5 1")
-                geom_idx += 1
+                _add_solid_box(wb, f"course_{geom_idx}", sx_pos, sh,
+                               actual_step_w / 2 + x_overlap, half_y, "0.4 0.45 0.5 1")
             cur_h -= n_steps * step_h
             cur_h = max(cur_h, 0.0)
             cur_x += seg_len
@@ -378,7 +356,7 @@ def _generate_course_xml(xml_path: Path, task: Any) -> tuple[Path, float]:
             geom_hf.set("friction", "0.8 0.005 0.0001")
             geom_hf.set("contype", "1")
             geom_hf.set("conaffinity", "1")
-            geom_hf.set("material", "groundplane")
+            geom_hf.set("rgba", "0.45 0.45 0.45 1")
             geom_idx += 1
             cur_x += seg_len
 

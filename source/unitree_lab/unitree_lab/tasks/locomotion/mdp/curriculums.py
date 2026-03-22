@@ -46,13 +46,11 @@ def terrain_levels_vel(
 
     episode_length = env.episode_length_buf[env_ids].clamp(min=1).float()
     lin_track_mean = reward._episode_sums["track_lin_vel_xy_exp"][env_ids] / episode_length
-    ang_track_mean = reward._episode_sums["track_ang_vel_z_exp"][env_ids] / episode_length
 
-    # Promote: walked far enough AND tracking quality is acceptable
+    # Promote: walked far enough AND linear velocity tracking is acceptable
     move_up = (
         (distance > terrain_size / 2)
         & (lin_track_mean > 0.5)
-        & (ang_track_mean > 0.3)
     )
     # Demote: barely moved OR tracking is very poor
     move_down = (distance < terrain_size / 4) | (lin_track_mean < 0.2)
@@ -139,6 +137,54 @@ def terrain_levels_vel(
 
     # return the mean terrain level
     return torch.mean(terrain.terrain_levels.float())
+
+
+def ang_vel_curriculum(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    delta: float = 0.1,
+    max_ang_vel: float = 2.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Gradually expand ang_vel_z range based on walking distance.
+
+    Only expands yaw command range; lin_vel_x and lin_vel_y stay fixed.
+    Envs that walk far enough get wider yaw range; envs that fail get narrower.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    terrain: TerrainImporter = env.scene.terrain
+    vel_cmd = env.command_manager.get_term("base_velocity")
+
+    distance = torch.norm(
+        asset.data.root_pos_w[env_ids, :2] - env.scene.env_origins[env_ids, :2], dim=1
+    )
+    terrain_size = terrain.cfg.terrain_generator.size[0]
+
+    passed = distance > terrain_size / 2
+    failed = distance < terrain_size / 4
+
+    passed_ids = env_ids[passed]
+    failed_ids = env_ids[failed]
+
+    init_lo, init_hi = vel_cmd.cfg.ranges.ang_vel_z
+    if passed_ids.numel() > 0:
+        vel_cmd.ang_vel_z_ranges[passed_ids, 0] = torch.clamp(
+            vel_cmd.ang_vel_z_ranges[passed_ids, 0] - delta, min=-max_ang_vel,
+        )
+        vel_cmd.ang_vel_z_ranges[passed_ids, 1] = torch.clamp(
+            vel_cmd.ang_vel_z_ranges[passed_ids, 1] + delta, max=max_ang_vel,
+        )
+    if failed_ids.numel() > 0:
+        vel_cmd.ang_vel_z_ranges[failed_ids, 0] = torch.clamp(
+            vel_cmd.ang_vel_z_ranges[failed_ids, 0] + delta, max=init_lo,
+        )
+        vel_cmd.ang_vel_z_ranges[failed_ids, 1] = torch.clamp(
+            vel_cmd.ang_vel_z_ranges[failed_ids, 1] - delta, min=init_hi,
+        )
+
+    env.curriculum_manager._curriculum_state.update({
+        "avg_vel_ang_z": torch.mean(vel_cmd.ang_vel_z_ranges[:, 1]),
+    })
 
 
 def command_levels_vel(

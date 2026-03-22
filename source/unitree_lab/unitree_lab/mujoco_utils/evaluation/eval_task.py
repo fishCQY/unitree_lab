@@ -106,28 +106,46 @@ LOCOMOTION_EVAL_TASKS = {
     ),
     "rough_forward": LocomotionEvalTask(
         name="rough_forward",
-        description="Walk forward on obstacle course: slopes, stairs and rough ground",
+        description="Walk forward on mixed terrain: pyramid stairs, slopes, and rough ground (IsaacLab style)",
         terrain_type="course",
         terrain_config={
             "difficulty": 1.0,
             "seed": 0,
-            "step_height": 0.10,
-            "step_width": 0.30,
-            "slope_angle": 0.15,
-            "course_platform_height": 0.50,
-            "noise_range": (-0.012, 0.012),
-            "noise_step": 0.004,
+            "step_height": 0.12,
+            "step_width": 0.28,
+            "slope_angle": 0.18,
+            "course_platform_height": 0.60,
+            "noise_range": (-0.015, 0.015),
+            "noise_step": 0.005,
             "course_segments": (
+                # --- Left half (behind spawn) ---
+                ("rough_ground", 11.0),
+                # Section 1: pyramid stairs
                 ("rough_ground", 2.0),
-                ("slope_up", 4.0),
-                ("platform", 2.0),
-                ("stairs_down", 2.0),
+                ("stairs_up", 2.5),
+                ("platform", 1.5),
+                ("stairs_down", 2.5),
+                # Section 2: pyramid slope
                 ("rough_ground", 2.0),
+                ("slope_up", 3.5),
+                ("platform", 1.5),
+                ("slope_down", 3.5),
+                # --- Spawn zone (x=0, only flat area) ---
                 ("flat", 3.0),
+                # --- Right half (forward from spawn) ---
+                # Section 3: stairs + slope back-to-back
                 ("rough_ground", 2.0),
                 ("stairs_up", 2.0),
-                ("platform", 2.0),
-                ("slope_down", 4.0),
+                ("stairs_down", 2.0),
+                ("slope_up", 3.0),
+                ("slope_down", 3.0),
+                # Section 4: mixed transitions (stairs↔slope crossover)
+                ("rough_ground", 2.0),
+                ("stairs_up", 2.5),
+                ("slope_down", 3.5),
+                ("rough_ground", 2.0),
+                ("slope_up", 3.5),
+                ("stairs_down", 2.5),
                 ("rough_ground", 2.0),
             ),
         },
