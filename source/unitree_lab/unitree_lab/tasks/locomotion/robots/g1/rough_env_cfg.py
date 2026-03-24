@@ -233,22 +233,12 @@ class G1ObservationsCfg:
         """Single-step AMP features for AMPPlugin (2D output).
 
         Must match offline data keys:
-          dof_pos(29) + dof_vel(29) + root_angle_vel(3) + proj_grav(3) + key_points_b(4*3=12) = 76 dim/frame.
-        Run scripts/add_key_points_to_amp_pkl.py to add key_points_b to PKL data.
+          dof_pos(29) + dof_vel(29) + root_angle_vel(3) + proj_grav(3) = 64 dim/frame.
         """
         joint_pos = ObsTerm(func=mdp.amp_joint_pos, params={"asset_cfg": SceneEntityCfg("robot")})
         joint_vel = ObsTerm(func=mdp.amp_joint_vel, params={"asset_cfg": SceneEntityCfg("robot")})
         base_ang_vel = ObsTerm(func=mdp.amp_base_ang_vel, params={"asset_cfg": SceneEntityCfg("robot")})
         projected_gravity = ObsTerm(func=mdp.amp_projected_gravity, params={"asset_cfg": SceneEntityCfg("robot")})
-        body_pos_b = ObsTerm(
-            func=mdp.amp_body_pos_b,
-            params={
-                "asset_cfg": SceneEntityCfg("robot", body_names=[
-                    "left_knee_link", "right_knee_link",
-                    "left_shoulder_yaw_link", "right_shoulder_yaw_link",
-                ]),
-            },
-        )
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -424,12 +414,20 @@ class UnitreeG1RoughEnvCfg(LocomotionEnvCfg):
         mirror_indices, mirror_signs = self._get_mirror_config()
 
         amp_conditions = {
-            "walk": [str(_AMP_DATA_DIR / "lafan_walk_clips.pkl")],
-            "run": [str(_AMP_DATA_DIR / "lafan_run_clips.pkl")],
+            "walk": [
+                str(_AMP_DATA_DIR / "walk1_subject1_3.36_39.1.pkl"),
+                str(_AMP_DATA_DIR / "walk1_subject1_81.86_120.4.pkl"),
+                str(_AMP_DATA_DIR / "walk1_subject2_78.13_132.23.pkl"),
+                str(_AMP_DATA_DIR / "walk1_subject2_173.03_218.2.pkl"),
+            ],
+            "run": [
+                str(_AMP_DATA_DIR / "run1_subject2_116.0_159.0.pkl"),
+                str(_AMP_DATA_DIR / "run1_subject5_5.6_56.6.pkl"),
+            ],
         }
         return load_conditional_amp_data(
             amp_conditions,
-            keys=["dof_pos", "dof_vel", "root_angle_vel", "proj_grav", "key_points_b"],
+            keys=["dof_pos", "dof_vel", "root_angle_vel", "proj_grav"],
             device=self.sim.device,
             mirror=True,
             joint_mirror_indices=mirror_indices,
