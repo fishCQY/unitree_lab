@@ -1,18 +1,16 @@
 """Adversarial Motion Priors (AMP) Plugin.
 
 Standalone AMP implementation that can be attached to any RL runner.
-Combines the best of unitree_lab and bfm_training approaches:
+Standalone AMP plugin that can be attached to any RL runner.
 
-From unitree_lab:
+Features:
   - Multiple loss types: GAN, LSGAN, WGAN
   - Linear interpolation (lerp) reward fusion
   - Per-layer weight decay for discriminator
-
-From bfm_training:
   - Plugin architecture (decoupled from PPO)
   - Conditional AMP with learnable embeddings
   - Training noise for regularization
-  - Valid sequence extraction from RolloutStorage (no CircularBuffer)
+  - Valid sequence extraction from RolloutStorage
   - Multi-GPU gradient synchronization
   - Learning rate scaling with policy lr
 
@@ -278,7 +276,7 @@ class AMPPlugin:
         return style_reward, disc_score
 
     def combine_reward(self, task_reward: torch.Tensor, style_reward: torch.Tensor) -> torch.Tensor:
-        """Combine task and style rewards additively (bfm_training style).
+        """Combine task and style rewards additively.
 
         style_reward already includes step_dt * style_reward_scale from reward().
         """

@@ -1,15 +1,77 @@
 """Core utilities for MuJoCo sim2sim."""
 
-from .onnx_utils import get_onnx_config, load_onnx_model, OnnxInference
-from .physics import pd_control, apply_onnx_physics_params
-from .xml_parsing import parse_actuators_from_xml, parse_joints_from_xml
+from .onnx_utils import (
+    get_onnx_config,
+    get_onnx_config_dataclass,
+    detect_policy_type,
+    init_hidden_states,
+    load_onnx_model,
+    OnnxConfig,
+    OnnxInference,
+)
+from .physics import (
+    pd_control,
+    pd_control_velocity,
+    get_tau_limit,
+    apply_onnx_physics_params,
+    set_joint_armature,
+    set_joint_damping,
+    set_joint_friction,
+    compute_projected_gravity,
+    compute_base_ang_vel_body,
+    compute_base_lin_vel_body,
+    quat_to_rotation_matrix,
+    quat_rotate_inverse,
+)
+from .xml_parsing import parse_actuators_from_xml, parse_joints_from_xml, build_joint_mapping, get_actuator_names
+from .joint_mapping import create_joint_mapping, model_to_mujoco, mujoco_to_model, create_joint_mapping_index
+from .math_utils import (
+    quat_rotate_inverse_np,
+    quat_rotate_forward_np,
+    quaternion_multiply,
+    quaternion_inverse,
+    yaw_from_quat,
+    yaw_quaternion,
+    subtract_frame_transforms_np,
+    se3_inverse,
+    apply_se3_transform,
+)
 
 __all__ = [
     "get_onnx_config",
-    "load_onnx_model", 
+    "get_onnx_config_dataclass",
+    "detect_policy_type",
+    "init_hidden_states",
+    "load_onnx_model",
+    "OnnxConfig",
     "OnnxInference",
     "pd_control",
+    "pd_control_velocity",
+    "get_tau_limit",
     "apply_onnx_physics_params",
+    "set_joint_armature",
+    "set_joint_damping",
+    "set_joint_friction",
+    "compute_projected_gravity",
+    "compute_base_ang_vel_body",
+    "compute_base_lin_vel_body",
+    "quat_to_rotation_matrix",
+    "quat_rotate_inverse",
     "parse_actuators_from_xml",
     "parse_joints_from_xml",
+    "build_joint_mapping",
+    "get_actuator_names",
+    "create_joint_mapping",
+    "model_to_mujoco",
+    "mujoco_to_model",
+    "create_joint_mapping_index",
+    "quat_rotate_inverse_np",
+    "quat_rotate_forward_np",
+    "quaternion_multiply",
+    "quaternion_inverse",
+    "yaw_from_quat",
+    "yaw_quaternion",
+    "subtract_frame_transforms_np",
+    "se3_inverse",
+    "apply_se3_transform",
 ]

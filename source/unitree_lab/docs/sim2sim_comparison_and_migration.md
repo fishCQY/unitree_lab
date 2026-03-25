@@ -13,7 +13,7 @@
 训练循环 (checkpoint 保存)
     │
     ↓
-LightOnPolicyRunner._save_checkpoint()
+MyOnPolicyRunner._save_checkpoint()
     ├─ 导出 ONNX + attach_onnx_metadata
     ├─ wandb.save(onnx)
     └─ env.unwrapped.mujoco_eval.batch_eval_and_log(onnx_path, iteration, num_workers=16)

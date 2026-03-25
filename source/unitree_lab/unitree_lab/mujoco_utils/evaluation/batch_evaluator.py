@@ -1,341 +1,356 @@
-"""Batch evaluator for sim2sim.
+# Copyright (c) 2024-2026, unitree_lab contributors.
+# SPDX-License-Identifier: BSD-3-Clause
 
-This module provides:
-1. Parallel evaluation of multiple tasks
-2. Video recording for visualization
-3. Metrics aggregation and reporting
-"""
+"""Batch evaluator for running multiple eval tasks in parallel."""
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
+import multiprocessing as mp
 import os
+import random
+import sys
+import time
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
-from .eval_task import EvalTask, LocomotionEvalTask, get_eval_task, list_eval_tasks
-from .metrics import LocomotionMetrics, compute_locomotion_metrics, print_metrics
+from ..logging import logger
+from .eval_task import get_eval_task, list_eval_tasks
+from .metrics import EvalResult
+
+
+def _resolve_gl_backend(onnx_path: str) -> str:
+    """Pick MuJoCo GL backend for eval workers.
+
+    Priority:
+    1) UNITREE_LAB_EVAL_MUJOCO_GL
+    2) ONNX metadata auto-detect (depth -> egl)
+    3) fallback: osmesa
+    """
+    forced = os.environ.get("UNITREE_LAB_EVAL_MUJOCO_GL")
+    if forced:
+        return forced.strip().lower()
+    try:
+        from ..core.onnx_utils import get_onnx_config
+        cfg = get_onnx_config(onnx_path)
+        if str(cfg.get("exteroception_type", "")).lower() == "depth":
+            return "egl"
+    except Exception as exc:
+        logger.warning(f"[eval] Failed to inspect ONNX metadata for GL backend: {exc}")
+    return "osmesa"
+
+
+def _resolve_gpu_ids() -> list[int]:
+    raw = os.environ.get("UNITREE_LAB_EVAL_GPU_IDS") or os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if raw:
+        ids: list[int] = []
+        for token in raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                ids.append(int(token))
+            except ValueError:
+                logger.warning(f"[eval] Ignoring invalid GPU id token: '{token}'")
+        if ids:
+            return ids
+    return [0]
+
+
+def _select_mp_context(gl_backend: str) -> mp.context.BaseContext:
+    methods = set(mp.get_all_start_methods())
+    forced = os.environ.get("UNITREE_LAB_EVAL_MP_START_METHOD")
+    if forced:
+        method = forced.strip().lower()
+        if method in methods:
+            return mp.get_context(method)
+        logger.warning(f"[eval] Invalid start method '{forced}', falling back to spawn.")
+    if sys.platform.startswith("linux") and gl_backend != "egl" and "fork" in methods:
+        return mp.get_context("fork")
+    if sys.platform.startswith("linux") and "forkserver" in methods:
+        return mp.get_context("forkserver")
+    return mp.get_context("spawn")
+
+
+def _set_subprocess_env(gl_backend: str, gpu_id: int | None) -> None:
+    os.environ["UNITREE_LAB_LIGHTWEIGHT"] = "1"
+    os.environ["MUJOCO_GL"] = gl_backend
+    os.environ["PYOPENGL_PLATFORM"] = gl_backend
+    if gl_backend == "egl" and gpu_id is not None:
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(gpu_id)
 
 
 @dataclass
-class EvalResult:
-    """Result from a single evaluation."""
-    task_name: str
-    metrics: LocomotionMetrics
-    episode_data: list[dict]
-    video_path: str | None = None
+class BatchEvalConfig:
+    num_workers: int = 16
+    task_names: list[str] | None = None
+    save_torque_data: bool = False
+    timeout_per_task: float = 100.0
+    save_mixed_terrain_video: bool = True
+    num_worst_videos: int = 2
 
 
-class BatchEvaluator:
-    """Batch evaluator for sim2sim policies.
-    
-    Runs evaluation across multiple tasks and collects metrics.
-    """
-    
-    def __init__(
-        self,
-        simulator_class: type,
-        xml_path: str | Path,
-        onnx_path: str | Path,
-        output_dir: str | Path = "eval_results",
-        **simulator_kwargs,
-    ):
-        """Initialize batch evaluator.
-        
-        Args:
-            simulator_class: Simulator class (subclass of BaseMujocoSimulator)
-            xml_path: Path to MuJoCo XML
-            onnx_path: Path to ONNX policy
-            output_dir: Output directory for results
-            **simulator_kwargs: Additional kwargs for simulator
-        """
-        self.simulator_class = simulator_class
-        self.xml_path = Path(xml_path)
-        self.onnx_path = Path(onnx_path)
-        self.output_dir = Path(output_dir)
-        self.simulator_kwargs = simulator_kwargs
-        
-        # Create output directory
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Results storage
-        self.results: list[EvalResult] = []
-    
-    def evaluate_task(
-        self,
-        task: LocomotionEvalTask | str,
-        num_episodes: int | None = None,
-        render: bool = False,
-        save_video: bool = False,
-        video_steps: int = 300,
-    ) -> EvalResult:
-        """Evaluate policy on a single task.
-        
-        Args:
-            task: Evaluation task or task name
-            num_episodes: Override number of episodes
-            render: Whether to render during evaluation
-            save_video: Whether to save video
-            
-        Returns:
-            Evaluation result
-        """
-        if isinstance(task, str):
-            task = get_eval_task(task)
-        
-        if num_episodes is None:
-            num_episodes = task.num_episodes
-        
-        print(f"\n[Eval] Running task: {task.name}")
-        print(f"       Description: {task.description}")
-        print(f"       Episodes: {num_episodes}")
-        
-        # Create simulator with terrain
-        simulator = self._create_simulator(task)
-        
-        # Run episodes
-        episode_data = []
-        for ep_idx in range(num_episodes):
-            print(f"  Episode {ep_idx + 1}/{num_episodes}", end="\r")
-            
-            # Set velocity command
-            if task.velocity_command_range and task.resample_command_interval:
-                # Random command
-                vx = np.random.uniform(*task.velocity_command_range[0])
-                vy = np.random.uniform(*task.velocity_command_range[1])
-                wz = np.random.uniform(*task.velocity_command_range[2])
-                velocity_cmd = (vx, vy, wz)
+@dataclass
+class BatchEvalResult:
+    results: list  # list[EvalResult]
+    video_paths: dict[str, str] | None = None
+
+    def get_video_path(self, task_name: str) -> str | None:
+        return self.video_paths.get(task_name) if self.video_paths else None
+
+    def to_wandb_dict(self, prefix: str = "sim2sim_eval") -> dict:
+        log_dict = {}
+        for r in self.results:
+            task_prefix = f"{prefix}/{r.task_name}"
+            if r.survival_rate is not None:
+                log_dict[f"{task_prefix}/survival_rate"] = r.survival_rate
+            if r.linear_velocity_error is not None:
+                log_dict[f"{task_prefix}/linear_velocity_error"] = r.linear_velocity_error
+            if r.angular_velocity_error is not None:
+                log_dict[f"{task_prefix}/angular_velocity_error"] = r.angular_velocity_error
+        return log_dict
+
+    def summary(self) -> str:
+        lines = ["=" * 70, "BATCH EVALUATION RESULTS", "=" * 70]
+        for r in sorted(self.results, key=lambda x: x.task_name):
+            if r.error:
+                lines.append(f"[ERR] {r.task_name}: {r.error[:50]}...")
             else:
-                velocity_cmd = task.velocity_command
-            
-            # Run episode
-            result = simulator.run_episode(
-                max_steps=task.max_episode_steps,
-                render=render,
-                velocity_command=velocity_cmd,
-            )
-            
-            episode_data.append(result)
-        
-        print()  # Clear line
-        
-        # Compute metrics
-        metrics = compute_locomotion_metrics(
-            episode_data,
-            np.array(task.velocity_command),
-            simulator.policy_dt,
-        )
-        
-        # Print metrics
-        print_metrics(metrics, task.name)
-        
-        # Video recording (if requested)
-        video_path = None
-        if save_video:
-            video_path = self._record_video(simulator, task, duration_steps=int(video_steps))
-        
-        return EvalResult(
-            task_name=task.name,
-            metrics=metrics,
-            episode_data=episode_data,
-            video_path=video_path,
-        )
-    
-    def evaluate_all(
-        self,
-        task_names: list[str] | None = None,
-        num_episodes_per_task: int = 10,
-        save_videos: bool = False,
-        video_steps: int = 300,
-    ) -> dict[str, EvalResult]:
-        """Evaluate policy on multiple tasks.
-        
-        Args:
-            task_names: List of task names (None = all tasks)
-            num_episodes_per_task: Episodes per task
-            save_videos: Whether to save videos
-            
-        Returns:
-            Dictionary of task_name -> EvalResult
-        """
-        if task_names is None:
-            task_names = list_eval_tasks()
-        
-        print(f"\n{'='*60}")
-        print(f"Batch Evaluation: {len(task_names)} tasks")
-        print(f"{'='*60}")
-        
-        results = {}
-        for task_name in task_names:
-            result = self.evaluate_task(
-                task_name,
-                num_episodes=num_episodes_per_task,
-                save_video=save_videos,
-                video_steps=int(video_steps),
-            )
-            results[task_name] = result
-            self.results.append(result)
-        
-        # Print summary
-        self._print_summary(results)
-        
-        return results
-    
-    def _create_simulator(self, task: LocomotionEvalTask) -> Any:
-        """Create simulator for task.
-        
-        Override in subclass to add terrain setup, etc.
-        """
-        return self.simulator_class(
-            xml_path=self.xml_path,
-            onnx_path=self.onnx_path,
-            **self.simulator_kwargs,
-        )
-    
-    def _record_video(
-        self,
-        simulator: Any,
-        task: LocomotionEvalTask,
-        duration_steps: int = 300,
-    ) -> str:
-        """Record evaluation video.
-        
-        Args:
-            simulator: Simulator instance
-            task: Evaluation task
-            duration_steps: Number of steps to record
-            
-        Returns:
-            Path to saved video
-        """
-        try:
-            import mujoco
-            import cv2
-        except ImportError:
-            print("[Warning] cv2 not available for video recording")
-            return None
-        
-        # Setup renderer
-        width, height = 640, 480
-        renderer = mujoco.Renderer(simulator.model, height, width)
-        
-        # Reset
-        simulator.reset()
-        simulator.set_velocity_command(*task.velocity_command)
-        
-        # Collect frames
-        frames = []
-        for step in range(duration_steps):
-            # Render
-            renderer.update_scene(simulator.data)
-            frame = renderer.render()
-            frames.append(frame)
-            
-            # Step
-            simulator.step()
-        
-        # Save video
-        video_path = self.output_dir / f"{task.name}_eval.mp4"
-        
-        # OpenCV often writes mp4v (MPEG-4 Part 2), which some browsers can't play in W&B.
-        # We write with mp4v for compatibility then transcode to H.264 (best-effort) if ffmpeg exists.
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        policy_dt = getattr(simulator, "policy_dt", 0.02)
-        fps = max(1, int(round(1.0 / policy_dt)))
-        writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
-        
-        for frame in frames:
-            # Convert RGB to BGR for cv2
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            writer.write(frame_bgr)
-        
-        writer.release()
-        # Best-effort: transcode to H.264 for browser/W&B playback
-        try:
-            import subprocess
+                sr = f"{r.survival_rate:.0%}" if r.survival_rate else "N/A"
+                lve = f"{r.linear_velocity_error:.3f}" if r.linear_velocity_error else "N/A"
+                ave = f"{r.angular_velocity_error:.3f}" if r.angular_velocity_error else "N/A"
+                lines.append(
+                    f"{r.task_name:30s} | surv: {sr:>4s} | lin_vel_err: {lve:>6s} m/s | ang_vel_err: {ave:>6s} rad/s"
+                )
+        lines.append("=" * 70)
+        return "\n".join(lines)
 
-            tmp = video_path.with_suffix(".h264_tmp.mp4")
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(video_path),
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                str(tmp),
-            ]
-            subprocess.run(cmd, check=True)
-            tmp.replace(video_path)
-        except Exception:
+
+def _run_single_task(args: tuple) -> EvalResult:
+    (
+        task_name, task_idx, onnx_path, robot_model_path,
+        video_file, torque_data_dir, simulation_fn_path,
+        gl_backend, gpu_ids,
+    ) = args
+
+    gpu_id = None
+    if gl_backend == "egl":
+        gpu_id = gpu_ids[task_idx % len(gpu_ids)]
+    _set_subprocess_env(gl_backend, gpu_id)
+
+    random.seed()
+    np.random.seed()
+
+    render = bool(video_file)
+
+    try:
+        eval_task = get_eval_task(task_name)
+
+        if simulation_fn_path:
+            module_path, fn_name = simulation_fn_path.rsplit(".", 1)
+            module = importlib.import_module(module_path)
+            mujoco_simulation = getattr(module, fn_name)
+        else:
+            sim_file = (
+                Path(__file__).resolve().parent.parent.parent
+                / "tasks" / "locomotion" / "mujoco_eval" / "simulator.py"
+            )
+            spec = importlib.util.spec_from_file_location("_mj_sim", sim_file)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mujoco_simulation = mod.run_locomotion_simulation
+
+        result = mujoco_simulation(
+            onnx_path=onnx_path,
+            mujoco_model_path=robot_model_path,
+            eval_task=eval_task,
+            render=render,
+            headless=True,
+            video_file=video_file,
+            torque_data_dir=torque_data_dir,
+        )
+        return result if result else EvalResult.from_error(task_name, "Simulation returned None")
+    except Exception as e:
+        error_msg = f"{str(e)}\n{traceback.format_exc()}"
+        return EvalResult.from_error(task_name, error_msg)
+
+
+def _determine_videos_to_keep(results: list, config: BatchEvalConfig) -> list[str]:
+    keep_tasks = set()
+    if config.save_mixed_terrain_video:
+        for r in results:
+            if r.task_name == "mixed_terrain" and not r.error:
+                keep_tasks.add("mixed_terrain")
+                break
+    if config.num_worst_videos > 0:
+        valid_results = [r for r in results if not r.error and r.survival_rate is not None]
+        sorted_results = sorted(
+            valid_results,
+            key=lambda r: (r.survival_rate, -(r.angular_velocity_error or 0)),
+        )
+        for r in sorted_results[: config.num_worst_videos]:
+            keep_tasks.add(r.task_name)
+    return list(keep_tasks)
+
+
+def _run_batch_headless(
+    task_names: list[str],
+    onnx_path: str,
+    robot_model_path: str,
+    torque_data_dir: str,
+    config: BatchEvalConfig,
+    simulation_fn_path: str | None = None,
+) -> list:
+    gl_backend = _resolve_gl_backend(onnx_path)
+    gpu_ids = _resolve_gpu_ids()
+    workers_per_gpu = max(1, int(os.environ.get("UNITREE_LAB_EVAL_WORKERS_PER_GPU", "1")))
+
+    num_workers = min(config.num_workers, len(task_names))
+    if gl_backend == "egl":
+        max_egl_workers = max(1, len(gpu_ids) * workers_per_gpu)
+        num_workers = min(num_workers, max_egl_workers)
+
+    logger.info(f"[eval] backend={gl_backend}, gpu_ids={gpu_ids}, workers={num_workers}")
+
+    start_time = time.time()
+    args_list = [
+        (name, idx, onnx_path, robot_model_path, "", torque_data_dir,
+         simulation_fn_path, gl_backend, gpu_ids)
+        for idx, name in enumerate(task_names)
+    ]
+
+    prev_lightweight = os.environ.get("UNITREE_LAB_LIGHTWEIGHT")
+    prev_mujoco_gl = os.environ.get("MUJOCO_GL")
+    prev_pyopengl = os.environ.get("PYOPENGL_PLATFORM")
+    os.environ["UNITREE_LAB_LIGHTWEIGHT"] = "1"
+    os.environ["MUJOCO_GL"] = gl_backend
+    os.environ["PYOPENGL_PLATFORM"] = gl_backend
+
+    results = []
+    completed = 0
+    try:
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=_select_mp_context(gl_backend),
+        ) as executor:
+            futures = {executor.submit(_run_single_task, args): args[0] for args in args_list}
+            completed_futures = set()
             try:
-                tmp.unlink()  # type: ignore[name-defined]
-            except Exception:
-                pass
-        print(f"  Video saved: {video_path}")
-        
-        return str(video_path)
-    
-    def _print_summary(self, results: dict[str, EvalResult]) -> None:
-        """Print evaluation summary."""
-        print("\n" + "=" * 60)
-        print("EVALUATION SUMMARY")
-        print("=" * 60)
-        
-        print(f"\n{'Task':<20} {'Survival':<12} {'Vel Error':<12} {'Distance':<12}")
-        print("-" * 60)
-        
-        for name, result in results.items():
-            m = result.metrics
-            print(f"{name:<20} {m.survival_rate:>10.1%} {m.mean_velocity_error:>10.3f} {m.mean_forward_distance:>10.2f}m")
-        
-        # Overall
-        all_metrics = [r.metrics for r in results.values()]
-        mean_survival = np.mean([m.survival_rate for m in all_metrics])
-        mean_vel_error = np.mean([m.mean_velocity_error for m in all_metrics])
-        total_distance = sum(m.total_distance for m in all_metrics)
-        
-        print("-" * 60)
-        print(f"{'OVERALL':<20} {mean_survival:>10.1%} {mean_vel_error:>10.3f} {total_distance:>10.2f}m")
-        print("=" * 60)
-    
-    def save_results(self, filename: str = "eval_results.npz") -> str:
-        """Save evaluation results to file.
-        
-        Args:
-            filename: Output filename
-            
-        Returns:
-            Path to saved file
-        """
-        output_path = self.output_dir / filename
-        
-        # Prepare data
-        data = {}
-        for result in self.results:
-            prefix = result.task_name
-            data[f"{prefix}_survival_rate"] = result.metrics.survival_rate
-            data[f"{prefix}_mean_velocity_error"] = result.metrics.mean_velocity_error
-            data[f"{prefix}_mean_distance"] = result.metrics.mean_forward_distance
-            data[f"{prefix}_episode_lengths"] = result.metrics.episode_lengths
-        
-        np.savez(output_path, **data)
-        print(f"Results saved: {output_path}")
-        
-        return str(output_path)
+                for future in as_completed(futures, timeout=config.timeout_per_task * len(task_names)):
+                    task_name = futures[future]
+                    completed_futures.add(future)
+                    try:
+                        result = future.result(timeout=config.timeout_per_task)
+                        results.append(result)
+                        sr = f"{result.survival_rate:.0%}" if result.survival_rate else "ERR"
+                    except Exception as e:
+                        results.append(EvalResult.from_error(task_name, str(e)))
+                        sr = "ERR"
+                    completed += 1
+                    elapsed = time.time() - start_time
+                    logger.info(f"[eval] [{completed}/{len(task_names)}] {task_name} surv={sr} ({elapsed:.1f}s)")
+            except TimeoutError:
+                for future, task_name in futures.items():
+                    if future not in completed_futures:
+                        results.append(EvalResult.from_error(task_name, "Task timed out"))
+                        future.cancel()
+    finally:
+        if prev_lightweight is None:
+            os.environ.pop("UNITREE_LAB_LIGHTWEIGHT", None)
+        else:
+            os.environ["UNITREE_LAB_LIGHTWEIGHT"] = prev_lightweight
+        if prev_mujoco_gl is None:
+            os.environ.pop("MUJOCO_GL", None)
+        else:
+            os.environ["MUJOCO_GL"] = prev_mujoco_gl
+        if prev_pyopengl is None:
+            os.environ.pop("PYOPENGL_PLATFORM", None)
+        else:
+            os.environ["PYOPENGL_PLATFORM"] = prev_pyopengl
+
+    return results
+
+
+def _run_video_tasks_serial(
+    task_names: list[str],
+    onnx_path: str,
+    robot_model_path: str,
+    video_dir: str,
+    timeout: float,
+    simulation_fn_path: str | None = None,
+) -> dict[str, str]:
+    video_paths = {}
+    gl_backend = _resolve_gl_backend(onnx_path)
+    gpu_ids = _resolve_gpu_ids()
+
+    for i, task_name in enumerate(task_names):
+        logger.info(f"[video] [{i + 1}/{len(task_names)}] Recording {task_name}...")
+        video_file = f"{video_dir}/{task_name}.mp4"
+        args = (task_name, i, onnx_path, robot_model_path, video_file, "",
+                simulation_fn_path, gl_backend, gpu_ids)
+        try:
+            result = _run_single_task(args)
+            if not result.error and os.path.exists(video_file):
+                video_paths[task_name] = video_file
+            else:
+                logger.warning(f"[video] {task_name} failed: {result.error[:50] if result.error else 'no video'}")
+        except Exception as e:
+            logger.error(f"[video] {task_name} exception: {e}")
+
+    return video_paths
+
+
+def run_batch_eval(
+    onnx_path: str,
+    robot_model_path: str,
+    config: BatchEvalConfig | None = None,
+    video_dir: str | None = None,
+    torque_data_dir: str | None = None,
+    simulation_fn_path: str | None = None,
+) -> BatchEvalResult:
+    """Run batch evaluation with two-phase strategy.
+
+    Phase 1: Run ALL tasks WITHOUT rendering (parallel, fast).
+    Phase 2: Re-run SELECTED tasks WITH rendering (serial, stable).
+    """
+    config = config or BatchEvalConfig()
+    task_names = config.task_names or list_eval_tasks()
+
+    effective_torque_dir = (torque_data_dir or "") if config.save_torque_data else ""
+    need_videos = video_dir and (config.save_mixed_terrain_video or config.num_worst_videos > 0)
+
+    logger.info(f"Starting batch eval: {len(task_names)} tasks, {config.num_workers} workers")
+    start_time = time.time()
+
+    results = _run_batch_headless(
+        task_names=task_names,
+        onnx_path=onnx_path,
+        robot_model_path=robot_model_path,
+        torque_data_dir=effective_torque_dir,
+        config=config,
+        simulation_fn_path=simulation_fn_path,
+    )
+
+    video_paths: dict[str, str] = {}
+    if need_videos and video_dir:
+        video_tasks = _determine_videos_to_keep(results, config)
+        if video_tasks:
+            os.makedirs(video_dir, exist_ok=True)
+            logger.info(f"Recording videos for {len(video_tasks)} tasks: {video_tasks}")
+            video_paths = _run_video_tasks_serial(
+                task_names=video_tasks,
+                onnx_path=onnx_path,
+                robot_model_path=robot_model_path,
+                video_dir=video_dir,
+                timeout=config.timeout_per_task + 60,
+                simulation_fn_path=simulation_fn_path,
+            )
+
+    elapsed = time.time() - start_time
+    logger.info(f"Batch eval completed in {elapsed:.1f}s ({len(results)} tasks)")
+    return BatchEvalResult(results=results, video_paths=video_paths or None)

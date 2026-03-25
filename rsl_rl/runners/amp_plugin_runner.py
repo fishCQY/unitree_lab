@@ -11,7 +11,7 @@ Data flow:
     4. After PPO update, AMPPlugin.update() trains the discriminator
        using sequences from the rollout and the offline dataset
 
-Sim2Sim (bfm_training style):
+Sim2Sim:
     On each checkpoint save, the runner directly calls MuJoCo sim2sim
     evaluation and uploads video + metrics to W&B. No subprocess needed.
 
@@ -281,7 +281,7 @@ class AMPPluginRunner(OnPolicyRunner):
         )
 
     # ------------------------------------------------------------------
-    # Sim2Sim (bfm_training style: direct call, no subprocess)
+    # Sim2Sim evaluation (direct call, no subprocess)
     # ------------------------------------------------------------------
 
     def _maybe_run_sim2sim(self, iteration: int) -> None:
@@ -298,7 +298,7 @@ class AMPPluginRunner(OnPolicyRunner):
             logger.warning(f"[Sim2Sim] Failed at iter {iteration}: {e}")
 
     def _run_sim2sim(self, iteration: int) -> None:
-        """Two-phase sim2sim evaluation (bfm_training style).
+        """Two-phase sim2sim evaluation.
 
         Phase 1: Run all eval tasks headless (no rendering) to collect metrics.
         Phase 2: Record videos for mixed_terrain + worst-performing tasks.
@@ -323,7 +323,7 @@ class AMPPluginRunner(OnPolicyRunner):
         duration = cfg.get("duration", 20.0)
         num_worst_videos = cfg.get("num_worst_videos", 2)
         xml_path_cfg = cfg.get("xml_path")
-        eval_tasks = cfg.get("eval_tasks", ["rough_forward"])
+        eval_tasks = cfg.get("eval_tasks", ["flat_stand"])
 
         out_dir = os.path.join(log_dir, "sim2sim", f"iter_{iteration}")
         os.makedirs(out_dir, exist_ok=True)
@@ -339,7 +339,7 @@ class AMPPluginRunner(OnPolicyRunner):
             if _script_dir not in _sys.path:
                 _sys.path.insert(0, _script_dir)
 
-            from unitree_lab.mujoco_utils.evaluation.eval_task import get_eval_task
+            from unitree_lab.mujoco_utils.evaluation.eval_task import TERRAIN_FLAT, get_eval_task
             from unitree_lab.mujoco_utils.evaluation.metrics import compute_locomotion_metrics
             from unitree_lab.mujoco_utils.simulation.base_simulator import BaseMujocoSimulator
             from run_sim2sim_locomotion import _generate_course_xml, _setup_terrain
@@ -361,17 +361,19 @@ class AMPPluginRunner(OnPolicyRunner):
                         _generate_course_xml, _setup_terrain,
                     )
 
-                    vel_cmd = task.velocity_command
+                    ref = np.asarray(task.get_velocity_command(float(task.warmup)), dtype=np.float64)
+                    vel_tuple = (float(ref[0]), float(ref[1]), float(ref[2]))
+                    max_steps = max(1, int(np.ceil(float(task.duration) / policy_dt)))
                     episodes = []
-                    for _ in range(task.num_episodes):
+                    for _ in range(1):
                         ep = simulator.run_episode(
-                            max_steps=task.max_episode_steps,
+                            max_steps=max_steps,
                             render=False,
-                            velocity_command=vel_cmd,
+                            velocity_command=vel_tuple,
                         )
                         episodes.append(ep)
 
-                    metrics = compute_locomotion_metrics(episodes, np.array(vel_cmd), policy_dt)
+                    metrics = compute_locomotion_metrics(episodes, ref, policy_dt)
                     task_results[task_name] = {
                         "survival_rate": metrics.survival_rate,
                         "mean_velocity_error": metrics.mean_velocity_error,
@@ -403,7 +405,7 @@ class AMPPluginRunner(OnPolicyRunner):
                     )
 
                     video_path = self._record_sim2sim_video(
-                        simulator, task, out_dir, max_steps, velocity=task.velocity_command,
+                        simulator, task, out_dir, max_steps, velocity=None,
                     )
                     if video_path and os.path.isfile(video_path):
                         videos[video_label] = video_path
@@ -426,20 +428,21 @@ class AMPPluginRunner(OnPolicyRunner):
     def _create_simulator_with_terrain(self, task, onnx_path, xml_path_cfg,
                                         config_override, _generate_course_xml, _setup_terrain):
         """Create a BaseMujocoSimulator with terrain injection for the given task."""
+        from unitree_lab.mujoco_utils.evaluation.eval_task import TERRAIN_FLAT
         from unitree_lab.mujoco_utils.simulation.base_simulator import BaseMujocoSimulator
 
         xml_path = xml_path_cfg
         if xml_path is None:
             _, xml_path = self._find_sim2sim_xml(task.name)
 
-        uses_terrain = task.terrain_type != "flat"
+        uses_terrain = task.terrain != TERRAIN_FLAT
         xml_path_obj = Path(xml_path) if xml_path else None
         tmp_xml = None
 
         if xml_path_obj is None:
             raise ValueError(f"No XML found for task {task.name}")
 
-        if uses_terrain and task.terrain_type == "course":
+        if uses_terrain and getattr(task, "terrain_type", None) == "course":
             xml_path_obj, course_spawn_z = _generate_course_xml(xml_path_obj, task)
             tmp_xml = xml_path_obj
             uses_terrain = False
@@ -470,8 +473,8 @@ class AMPPluginRunner(OnPolicyRunner):
         """Select tasks for video recording: rough_forward + worst N tasks."""
         video_tasks = []
 
-        if "rough_forward" in task_results:
-            video_tasks.append(("sim2sim_video", "rough_forward"))
+        if "mixed_terrain" in task_results:
+            video_tasks.append(("sim2sim_video", "mixed_terrain"))
 
         sorted_tasks = sorted(
             task_results.items(),
@@ -481,7 +484,7 @@ class AMPPluginRunner(OnPolicyRunner):
         for task_name, _ in sorted_tasks:
             if worst_count >= num_worst:
                 break
-            if task_name == "rough_forward":
+            if task_name == "mixed_terrain":
                 continue
             worst_count += 1
             video_tasks.append((f"sim2sim_video_worst_{worst_count}", task_name))
@@ -689,11 +692,17 @@ class AMPPluginRunner(OnPolicyRunner):
         cam.lookat[:] = [0, 0, 0.8]
 
         simulator.reset()
-        vel_cmd = velocity if velocity is not None else (0.5, 0.0, 0.0)
-        simulator.set_velocity_command(*vel_cmd)
+        policy_dt = float(getattr(simulator, "policy_dt", 0.02))
 
         frames = []
-        for _ in range(duration_steps):
+        for step_i in range(duration_steps):
+            if velocity is not None:
+                simulator.set_velocity_command(*velocity)
+            elif hasattr(task, "get_velocity_command"):
+                vt = task.get_velocity_command(step_i * policy_dt)
+                simulator.set_velocity_command(float(vt[0]), float(vt[1]), float(vt[2]))
+            else:
+                simulator.set_velocity_command(0.5, 0.0, 0.0)
             renderer.update_scene(simulator.data, camera=cam)
             frames.append(renderer.render().copy())
             simulator.step()
@@ -721,14 +730,20 @@ class AMPPluginRunner(OnPolicyRunner):
 
         return str(video_file)
 
-    def _find_sim2sim_xml(self, task: str = "rough_forward"):
+    def _find_sim2sim_xml(self, task: str = "flat_stand"):
         rl_lab_root = Path(__file__).resolve().parents[2]
         script = rl_lab_root / "scripts" / "mujoco_eval" / "run_sim2sim_locomotion.py"
         xml_dir = rl_lab_root / "source" / "unitree_lab" / "unitree_lab" / "assets" / "robots_xml" / "g1"
-        terrain_tasks = {"rough_forward", "stairs_up", "stairs_down", "slope_up", "mixed_terrain"}
         terrain_xml = xml_dir / "scene_29dof_terrain.xml"
         flat_xml = xml_dir / "scene_29dof.xml"
-        xml = terrain_xml if (task in terrain_tasks and terrain_xml.exists()) else flat_xml
+        use_terrain = False
+        try:
+            from unitree_lab.mujoco_utils.evaluation.eval_task import TERRAIN_FLAT, get_eval_task
+
+            use_terrain = get_eval_task(task).terrain != TERRAIN_FLAT
+        except Exception:
+            use_terrain = task not in ("flat_stand", "flat_comprehensive")
+        xml = terrain_xml if (use_terrain and terrain_xml.exists()) else flat_xml
         return (str(script) if script.exists() else None, str(xml) if xml.exists() else None)
 
     # ------------------------------------------------------------------

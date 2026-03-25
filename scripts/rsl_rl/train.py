@@ -359,6 +359,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     if agent_cfg.class_name == "AMPPluginRunner":
         runner = AMPPluginRunner(env, agent_dict, log_dir=log_dir, device=agent_cfg.device)
+    elif agent_cfg.class_name == "UnitreeOnPolicyRunner":
+        from unitree_lab.utils.unitree_on_policy_runner import UnitreeOnPolicyRunner
+
+        runner = UnitreeOnPolicyRunner(env, agent_dict, log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_dict, log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":

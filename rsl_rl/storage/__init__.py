@@ -6,6 +6,7 @@
 """Implementation of transitions storage for RL-agent."""
 
 from .rollout_storage import RolloutStorage
+from .rollout_storage_tf import RolloutStorageTF
 from .circular_buffer import CircularBuffer
 
-__all__ = ["RolloutStorage", "CircularBuffer"]
+__all__ = ["RolloutStorage", "RolloutStorageTF", "CircularBuffer"]

@@ -6,7 +6,7 @@ This module provides utilities for:
 - WandB experiment tracking
 - Checkpoint management
 - Experiment directory management
-- Training runner with integrated logging
+- UnitreeOnPolicyRunner (ONNX + wandb) and optional ManagedExperimentRunner
 
 See docs/UTILS_OVERVIEW.md for detailed documentation.
 """
@@ -52,10 +52,13 @@ from .experiment_tracker import (
     create_experiment,
 )
 
-# Training runner
+# Training runner (rsl_rl OnPolicyRunner extension)
+from .unitree_on_policy_runner import UnitreeOnPolicyRunner
+
+# Optional experiment helper (non-rsl_rl)
 from .training_runner import (
-    LightRunnerConfig,
-    LightOnPolicyRunner,
+    RunnerConfig,
+    ManagedExperimentRunner,
     create_runner,
 )
 
@@ -87,7 +90,8 @@ __all__ = [
     "ExperimentTracker",
     "create_experiment",
     # Training runner
-    "LightRunnerConfig",
-    "LightOnPolicyRunner",
+    "RunnerConfig",
+    "UnitreeOnPolicyRunner",
+    "ManagedExperimentRunner",
     "create_runner",
 ]

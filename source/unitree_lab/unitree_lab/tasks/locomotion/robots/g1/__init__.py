@@ -4,6 +4,10 @@ import gymnasium as gym
 
 from unitree_lab.tasks.locomotion.config import agents
 
+# =============================================================================
+# Legacy registrations (ManagerBasedRLEnv)
+# =============================================================================
+
 # --- Rough terrain (GRU + AMP Plugin, default) ---
 gym.register(
     id="unitree_lab-Isaac-Velocity-Rough-Unitree-G1-AMP-v0",
@@ -48,6 +52,50 @@ gym.register(
 gym.register(
     id="unitree_lab-Isaac-Velocity-Flat-Unitree-G1-AMP-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeG1FlatEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeG1FlatPluginRunnerCfg",
+    },
+)
+
+# =============================================================================
+# UnitreeRLEnv registrations (with ONNX metadata + sim2sim integration)
+# =============================================================================
+
+# --- Rough terrain (UnitreeRLEnv + GRU + AMP Plugin) ---
+gym.register(
+    id="unitree_lab-Isaac-Velocity-Rough-Unitree-G1-AMP-v1",
+    entry_point="unitree_lab.envs:UnitreeRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeG1RoughEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeG1RoughPluginRunnerCfg",
+    },
+)
+gym.register(
+    id="unitree_lab-Isaac-Velocity-Rough-Unitree-G1-AMP-Play-v1",
+    entry_point="unitree_lab.envs:UnitreeRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeG1RoughEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeG1RoughPluginRunnerCfg",
+    },
+)
+
+# --- Flat terrain (UnitreeRLEnv + GRU + AMP Plugin) ---
+gym.register(
+    id="unitree_lab-Isaac-Velocity-Flat-Unitree-G1-AMP-v1",
+    entry_point="unitree_lab.envs:UnitreeRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeG1FlatEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeG1FlatPluginRunnerCfg",
+    },
+)
+gym.register(
+    id="unitree_lab-Isaac-Velocity-Flat-Unitree-G1-AMP-Play-v1",
+    entry_point="unitree_lab.envs:UnitreeRLEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeG1FlatEnvCfg_PLAY",

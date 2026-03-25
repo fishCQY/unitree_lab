@@ -1,7 +1,7 @@
 """Enhanced training runner with integrated experiment tracking.
 
 This module provides:
-1. LightOnPolicyRunner - Enhanced PPO runner with full tracking
+1. ManagedExperimentRunner - Experiment directory / WandB helper (non-rsl_rl)
 2. Automatic ONNX export with metadata
 3. WandB integration for logging and artifacts
 4. Checkpoint management with versioning
@@ -26,8 +26,8 @@ import yaml
 
 
 @dataclass
-class LightRunnerConfig:
-    """Configuration for LightOnPolicyRunner."""
+class RunnerConfig:
+    """Configuration for ManagedExperimentRunner."""
     
     # Experiment settings
     experiment_name: str = "default"
@@ -61,21 +61,17 @@ class LightRunnerConfig:
     resume_path: Optional[str] = None
 
 
-class LightOnPolicyRunner:
-    """Enhanced on-policy training runner with experiment tracking.
+class ManagedExperimentRunner:
+    """Experiment tracking helper (metrics, checkpoints, ONNX) outside rsl_rl's loop.
     
-    This runner wraps standard RL training with:
-    - Automatic experiment directory setup
-    - WandB logging (metrics, configs, artifacts)
-    - Checkpoint management
-    - ONNX export with IsaacLab metadata
-    - Code snapshots for reproducibility
+    For Isaac Lab + rsl_rl training, prefer ``UnitreeOnPolicyRunner`` in
+    ``unitree_lab.utils.unitree_on_policy_runner``.
     
     Example:
-        >>> runner = LightOnPolicyRunner(
+        >>> runner = ManagedExperimentRunner(
         ...     env=env,
         ...     agent=agent,
-        ...     config=LightRunnerConfig(
+        ...     config=RunnerConfig(
         ...         experiment_name="locomotion",
         ...         use_wandb=True,
         ...     )
@@ -87,7 +83,7 @@ class LightOnPolicyRunner:
         self,
         env,
         agent,
-        config: LightRunnerConfig,
+        config: RunnerConfig,
         train_cfg: Optional[Any] = None,
     ):
         """
@@ -442,8 +438,8 @@ def create_runner(
     use_wandb: bool = True,
     log_dir: str = "logs",
     **kwargs,
-) -> LightOnPolicyRunner:
-    """Create a configured training runner.
+) -> ManagedExperimentRunner:
+    """Create a configured ManagedExperimentRunner.
     
     Args:
         env: IsaacLab environment
@@ -454,13 +450,13 @@ def create_runner(
         **kwargs: Additional config options
         
     Returns:
-        Configured LightOnPolicyRunner
+        Configured ManagedExperimentRunner
     """
-    config = LightRunnerConfig(
+    config = RunnerConfig(
         experiment_name=experiment_name,
         use_wandb=use_wandb,
         log_dir=log_dir,
         **kwargs,
     )
     
-    return LightOnPolicyRunner(env=env, agent=agent, config=config)
+    return ManagedExperimentRunner(env=env, agent=agent, config=config)

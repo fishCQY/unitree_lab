@@ -38,14 +38,34 @@ class WandbSummaryWriter(SummaryWriter):
         wandb.init(project=project, entity=entity, name=run_name)
         wandb.config.update({"log_dir": log_dir})
 
-    def store_config(self, env_cfg: dict | object, train_cfg: dict) -> None:
-        wandb.config.update({"runner_cfg": train_cfg})
-        wandb.config.update({"policy_cfg": train_cfg["policy"]})
-        wandb.config.update({"alg_cfg": train_cfg["algorithm"]})
+    def store_config(
+        self,
+        env_cfg: dict | object,
+        runner_cfg: dict,
+        alg_cfg: dict | None = None,
+        policy_cfg: dict | None = None,
+    ) -> None:
+        if alg_cfg is None:
+            alg_cfg = runner_cfg["algorithm"]
+        if policy_cfg is None:
+            policy_cfg = runner_cfg["policy"]
+        wandb.config.update({"runner_cfg": runner_cfg})
+        wandb.config.update({"policy_cfg": policy_cfg})
+        wandb.config.update({"alg_cfg": alg_cfg})
         try:
             wandb.config.update({"env_cfg": env_cfg.to_dict()})
         except Exception:
             wandb.config.update({"env_cfg": asdict(env_cfg)})
+
+    def log_config(
+        self,
+        env_cfg: dict | object,
+        runner_cfg: dict,
+        alg_cfg: dict | None = None,
+        policy_cfg: dict | None = None,
+    ) -> None:
+        """Log full training configuration to wandb (same keys as ``store_config``)."""
+        self.store_config(env_cfg, runner_cfg, alg_cfg, policy_cfg)
 
     def add_scalar(
         self,

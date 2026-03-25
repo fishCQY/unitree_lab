@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2025, Light Robotics.
+# Copyright (c) 2024-2025, unitree_lab contributors.
 # All rights reserved.
 
 # Copyright (c) 2022-2024, The Isaac Lab Project Developers.

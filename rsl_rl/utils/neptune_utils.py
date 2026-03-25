@@ -53,14 +53,33 @@ class NeptuneSummaryWriter(SummaryWriter):
             "Train/mean_episode_length/time": "Train/mean_episode_length_time",
         }
 
-    def store_config(self, env_cfg: dict | object, train_cfg: dict) -> None:
-        self.run["runner_cfg"] = train_cfg
-        self.run["policy_cfg"] = train_cfg["policy"]
-        self.run["alg_cfg"] = train_cfg["algorithm"]
+    def store_config(
+        self,
+        env_cfg: dict | object,
+        runner_cfg: dict,
+        alg_cfg: dict | None = None,
+        policy_cfg: dict | None = None,
+    ) -> None:
+        if alg_cfg is None:
+            alg_cfg = runner_cfg["algorithm"]
+        if policy_cfg is None:
+            policy_cfg = runner_cfg["policy"]
+        self.run["runner_cfg"] = runner_cfg
+        self.run["policy_cfg"] = policy_cfg
+        self.run["alg_cfg"] = alg_cfg
         try:
             self.run["env_cfg"] = env_cfg.to_dict()
         except Exception:
             self.run["env_cfg"] = asdict(env_cfg)
+
+    def log_config(
+        self,
+        env_cfg: dict | object,
+        runner_cfg: dict,
+        alg_cfg: dict | None = None,
+        policy_cfg: dict | None = None,
+    ) -> None:
+        self.store_config(env_cfg, runner_cfg, alg_cfg, policy_cfg)
 
     def add_scalar(
         self,

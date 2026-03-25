@@ -14,6 +14,7 @@ setup(
         "rsl_rl.runners",
         "rsl_rl.storage",
         "rsl_rl.utils",
+        "rsl_rl.isaaclab_rl",
     ],
     package_dir={"rsl_rl": "."},
     python_requires=">=3.10",

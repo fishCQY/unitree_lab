@@ -7,17 +7,17 @@ environment alignment (observation semantics, PD control, terrain, timing).
 Usage examples:
     # Interactive viewer with keyboard teleop (flat ground)
     python scripts/mujoco_eval/run_sim2sim_locomotion.py \
-        --robot g1 --onnx path/to/policy.onnx --task flat_forward \
+        --robot g1 --onnx path/to/policy.onnx --task flat_stand \
         --render --teleop keyboard
 
     # Headless batch evaluation with video recording
     python scripts/mujoco_eval/run_sim2sim_locomotion.py \
-        --robot g1 --onnx path/to/policy.onnx --task rough_forward \
+        --robot g1 --onnx path/to/policy.onnx --task slope_comprehensive \
         --num-episodes 10 --save-video --output-dir eval_results
 
     # Deploy mode with optional deploy.yaml for PD gains override
     python scripts/mujoco_eval/run_sim2sim_locomotion.py \
-        --robot g1 --onnx path/to/policy.onnx --task flat_forward \
+        --robot g1 --onnx path/to/policy.onnx --task flat_stand \
         --render --deploy --follow --deploy-yaml path/to/deploy.yaml
 """
 
@@ -58,6 +58,78 @@ ROBOT_CONFIGS: dict[str, dict[str, Any]] = {
         "dof": 29,
     },
 }
+
+
+def _mid_range(r: Any) -> float:
+    if r is None:
+        return 0.1
+    if isinstance(r, (tuple, list)) and len(r) >= 2:
+        return (float(r[0]) + float(r[1])) / 2.0
+    return float(r)
+
+
+def _terrain_dict_to_gen_cfg(terrain: dict) -> dict | None:
+    """Map bfm-style :class:`~unitree_lab.mujoco_utils.evaluation.eval_task.EvalTask` terrain dict to generator kwargs."""
+    from unitree_lab.mujoco_utils.evaluation.eval_task import TERRAIN_FLAT
+
+    if terrain is None or terrain == TERRAIN_FLAT:
+        return {"terrain_type": "flat"}
+    if len(terrain) != 1:
+        return None
+    (name, spec), = terrain.items()
+    if float(spec.get("proportion", 1.0)) < 0.999:
+        return None
+    sub = {k: v for k, v in spec.items() if k != "proportion"}
+
+    if name == "plane":
+        return {"terrain_type": "flat"}
+    if name == "RandomUniform":
+        return {
+            "terrain_type": "random_uniform",
+            "noise_range": tuple(sub.get("noise_range", (-0.05, 0.05))),
+            "noise_step": float(sub.get("noise_step", 0.01)),
+        }
+    if name == "PyramidStairs":
+        sh = sub.get("step_height_range", (0.1, 0.15))
+        return {
+            "terrain_type": "pyramid_stairs",
+            "step_height": _mid_range(sh),
+            "step_width": float(sub.get("step_width", 0.3)),
+        }
+    if name == "InvertedPyramidStairs":
+        sh = sub.get("step_height_range", (0.1, 0.15))
+        return {
+            "terrain_type": "pyramid_stairs_inv",
+            "step_height": _mid_range(sh),
+            "step_width": float(sub.get("step_width", 0.3)),
+        }
+    if name == "PyramidSloped":
+        sr = sub.get("slope_range", (0.25, 0.25))
+        return {
+            "terrain_type": "pyramid_sloped",
+            "slope_angle": _mid_range(sr),
+        }
+    if name == "InvertedPyramidSloped":
+        sr = sub.get("slope_range", (0.25, 0.25))
+        return {
+            "terrain_type": "pyramid_sloped_inv",
+            "slope_angle": _mid_range(sr),
+        }
+    if name == "Rails":
+        return {
+            "terrain_type": "rails",
+            "rail_height_range": tuple(sub.get("rail_height_range", (0.02, 0.06))),
+            "rail_spacing_range": tuple(sub.get("rail_spacing_range", (0.4, 0.2))),
+        }
+    return None
+
+
+def _task_ref_velocity_tuple(task: Any) -> tuple[float, float, float]:
+    if hasattr(task, "get_velocity_command"):
+        w = float(getattr(task, "warmup", 0.0))
+        v = task.get_velocity_command(w)
+        return (float(v[0]), float(v[1]), float(v[2]))
+    return (0.5, 0.0, 0.0)
 
 
 def _find_asset_dir() -> Path:
@@ -147,6 +219,10 @@ def _generate_course_xml(xml_path: Path, task: Any) -> tuple[Path, float]:
     import tempfile
     import xml.etree.ElementTree as ET
 
+    if not hasattr(task, "get_terrain_config"):
+        raise TypeError(
+            "Course XML generation requires get_terrain_config(); EvalTask uses terrain dicts only."
+        )
     terrain_cfg = task.get_terrain_config()
     segments = terrain_cfg.get("course_segments", ())
     step_h = float(terrain_cfg.get("step_height", 0.05))
@@ -386,8 +462,15 @@ def _setup_terrain(
     from unitree_lab.mujoco_utils.terrain.generator import MujocoTerrainGenerator
     from unitree_lab.mujoco_utils.terrain.xml_generation import setup_terrain_data_in_model
 
-    terrain_cfg_dict = task.get_terrain_config()
-    terrain_type = terrain_cfg_dict.get("terrain_type", "flat")
+    terrain = getattr(task, "terrain", None)
+    base_cfg = _terrain_dict_to_gen_cfg(terrain if isinstance(terrain, dict) else None)
+    if base_cfg is None:
+        print(
+            "[Warning] Terrain layout not supported for runtime heightfield injection "
+            "(e.g. RandomGrid / mixed); using XML heightfield as-is."
+        )
+        return 0.0
+    terrain_type = base_cfg.get("terrain_type", "flat")
 
     if terrain_type == "flat":
         return 0.0
@@ -413,7 +496,7 @@ def _setup_terrain(
         "size": (world_x, world_y),
         "horizontal_scale": world_x / max(1, ncol - 1),
     }
-    for k, v in terrain_cfg_dict.items():
+    for k, v in base_cfg.items():
         if k != "terrain_type":
             gen_cfg[k] = v
 
@@ -598,8 +681,9 @@ def run_interactive(
 
     if velocity and teleop != "keyboard":
         simulator.set_velocity_command(*velocity)
-    elif hasattr(task, "velocity_command") and teleop != "keyboard":
-        simulator.set_velocity_command(*task.velocity_command)
+    elif teleop != "keyboard" and hasattr(task, "get_velocity_command"):
+        v0 = _task_ref_velocity_tuple(task)
+        simulator.set_velocity_command(*v0)
 
     viewer = mujoco.viewer.launch_passive(
         simulator.model, simulator.data, key_callback=key_callback,
@@ -625,8 +709,9 @@ def run_interactive(
                 simulator.set_velocity_command(*teleop_ctrl.command)
             elif velocity:
                 simulator.set_velocity_command(*velocity)
-            elif hasattr(task, "velocity_command"):
-                simulator.set_velocity_command(*task.velocity_command)
+            elif hasattr(task, "get_velocity_command"):
+                v0 = task.get_velocity_command(0.0)
+                simulator.set_velocity_command(float(v0[0]), float(v0[1]), float(v0[2]))
 
             _prev_time = time.monotonic()
             _fps_window.clear()
@@ -640,6 +725,10 @@ def run_interactive(
                     simulator.set_velocity_command(*teleop_ctrl.command)
                     teleop_ctrl._dirty = False
                     teleop_ctrl.flush_msg()
+                elif teleop_ctrl is None and velocity is None and hasattr(task, "get_velocity_command"):
+                    t_cmd = _step * policy_dt
+                    vt = task.get_velocity_command(t_cmd)
+                    simulator.set_velocity_command(float(vt[0]), float(vt[1]), float(vt[2]))
 
                 simulator.step()
 
@@ -718,21 +807,28 @@ def run_headless(
     output_dir: str = "eval_results",
     video_steps: int = 500,
     velocity: tuple[float, float, float] | None = None,
+    max_steps: int | None = None,
 ) -> dict[str, Any]:
     """Run headless evaluation episodes."""
-    from unitree_lab.mujoco_utils.evaluation.batch_evaluator import BatchEvaluator
     from unitree_lab.mujoco_utils.evaluation.metrics import (
         compute_locomotion_metrics,
         print_metrics,
     )
 
-    vel_cmd = velocity if velocity is not None else getattr(task, "velocity_command", (0.5, 0.0, 0.0))
+    policy_dt = float(getattr(simulator, "policy_dt", 0.02))
+    n_steps = max_steps
+    if n_steps is None and hasattr(task, "duration"):
+        n_steps = max(1, int(np.ceil(float(task.duration) / policy_dt)))
+    elif n_steps is None:
+        n_steps = 1000
+
+    vel_cmd = velocity if velocity is not None else _task_ref_velocity_tuple(task)
     episode_results = []
 
     for ep_idx in range(num_episodes):
         print(f"  Episode {ep_idx + 1}/{num_episodes}", end="\r", flush=True)
         result = simulator.run_episode(
-            max_steps=task.max_episode_steps,
+            max_steps=n_steps,
             render=False,
             velocity_command=vel_cmd,
         )
@@ -741,7 +837,7 @@ def run_headless(
     print()
 
     metrics = compute_locomotion_metrics(
-        episode_results, np.array(vel_cmd), simulator.policy_dt
+        episode_results, np.array(vel_cmd, dtype=np.float64), simulator.policy_dt
     )
     print_metrics(metrics, task.name)
 
@@ -762,11 +858,10 @@ def run_headless(
 
 
 def _render_one_frame_tracking(simulator: Any) -> np.ndarray:
-    """Render one frame with the same tracking camera as headless video (for interactive recording)."""
+    """Render one frame with tracking camera and visualization overlays."""
     import mujoco
     width, height = 1280, 720
     if getattr(simulator, "_video_renderer", None) is None:
-        # Ensure offscreen framebuffer is large enough (model XML may use smaller default).
         if simulator.model.vis.global_.offwidth < width:
             simulator.model.vis.global_.offwidth = width
         if simulator.model.vis.global_.offheight < height:
@@ -783,7 +878,33 @@ def _render_one_frame_tracking(simulator: Any) -> np.ndarray:
         cam.lookat[:] = [0, 0, 0.8]
         simulator._video_cam = cam
     simulator._video_renderer.update_scene(simulator.data, camera=simulator._video_cam)
-    return simulator._video_renderer.render()
+    frame = simulator._video_renderer.render()
+
+    try:
+        from unitree_lab.mujoco_utils.visualization.panels import create_combined_visualization
+        from scipy.spatial.transform import Rotation as Rot
+
+        quat = simulator.base_quat
+        r = Rot.from_quat([quat[1], quat[2], quat[3], quat[0]])
+        base_lin_vel = r.inv().apply(simulator.base_lin_vel)
+        torque_util = np.zeros(simulator.num_actions, dtype=np.float32)
+        cmd = np.array(simulator.velocity_command, dtype=np.float32)
+        frame = create_combined_visualization(
+            sim_frame=frame,
+            torque_util=torque_util,
+            num_actions=simulator.num_actions,
+            base_lin_vel=base_lin_vel,
+            exteroception=None,
+            exteroception_type=None,
+            robot_z=simulator.base_pos[2],
+            sim_time=simulator.data.time,
+            command=cmd,
+            command_idx=0,
+        )
+    except ImportError:
+        pass
+
+    return frame
 
 
 def _write_frames_to_video(
@@ -903,13 +1024,50 @@ def _record_video_headless(
     cam.lookat[:] = [0, 0, 0.8]
 
     simulator.reset()
-    vel_cmd = velocity if velocity is not None else getattr(task, "velocity_command", (0.5, 0.0, 0.0))
-    simulator.set_velocity_command(*vel_cmd)
+    policy_dt = float(getattr(simulator, "policy_dt", 0.02))
+
+    try:
+        from unitree_lab.mujoco_utils.visualization.panels import create_combined_visualization
+        from scipy.spatial.transform import Rotation as Rot
+        _has_viz = True
+    except ImportError:
+        _has_viz = False
 
     frames: list[np.ndarray] = []
-    for _ in range(duration_steps):
+    for step_i in range(duration_steps):
+        cmd = None
+        if velocity is not None:
+            simulator.set_velocity_command(*velocity)
+            cmd = np.array(velocity, dtype=np.float32)
+        elif hasattr(task, "get_velocity_command"):
+            vt = task.get_velocity_command(step_i * policy_dt)
+            simulator.set_velocity_command(float(vt[0]), float(vt[1]), float(vt[2]))
+            cmd = np.asarray(vt, dtype=np.float32)
+        else:
+            simulator.set_velocity_command(0.5, 0.0, 0.0)
+            cmd = np.array([0.5, 0.0, 0.0], dtype=np.float32)
+
         renderer.update_scene(simulator.data, camera=cam)
         frame = renderer.render()
+
+        if _has_viz:
+            quat = simulator.base_quat
+            r = Rot.from_quat([quat[1], quat[2], quat[3], quat[0]])
+            base_lin_vel = r.inv().apply(simulator.base_lin_vel)
+            torque_util = np.zeros(simulator.num_actions, dtype=np.float32)
+            frame = create_combined_visualization(
+                sim_frame=frame,
+                torque_util=torque_util,
+                num_actions=simulator.num_actions,
+                base_lin_vel=base_lin_vel,
+                exteroception=None,
+                exteroception_type=None,
+                robot_z=simulator.base_pos[2],
+                sim_time=simulator.data.time,
+                command=cmd,
+                command_idx=step_i,
+            )
+
         frames.append(frame)
         simulator.step()
 
@@ -955,7 +1113,7 @@ def parse_args() -> argparse.Namespace:
                         help="Path to ONNX policy file")
     parser.add_argument("--xml", type=str, default=None,
                         help="Path to MuJoCo XML (overrides auto-detection)")
-    parser.add_argument("--task", type=str, default="flat_forward",
+    parser.add_argument("--task", type=str, default="flat_stand",
                         help="Evaluation task name (see --list-tasks)")
     parser.add_argument("--list-tasks", action="store_true",
                         help="List available evaluation tasks and exit")
@@ -1016,16 +1174,15 @@ def main() -> None:
         sys.exit(1)
 
     # Get task
-    from unitree_lab.mujoco_utils.evaluation.eval_task import get_eval_task
+    from unitree_lab.mujoco_utils.evaluation.eval_task import TERRAIN_FLAT, get_eval_task
+
     task = get_eval_task(args.task)
     print(f"\n{'='*60}")
     print(f"  Sim2Sim Locomotion: {task.name}")
     print(f"  {task.description}")
     print(f"{'='*60}\n")
 
-    # Override max episode steps if provided
-    if args.max_steps is not None:
-        task.max_episode_steps = args.max_steps
+    is_flat_terrain = task.terrain == TERRAIN_FLAT
 
     # Robot config
     robot_cfg = ROBOT_CONFIGS[args.robot]
@@ -1033,11 +1190,9 @@ def main() -> None:
 
     if args.xml:
         xml_path = Path(args.xml)
-        uses_terrain = False
-        if "terrain" in xml_path.name.lower():
-            uses_terrain = task.terrain_type not in ("flat",)
+        uses_terrain = (not is_flat_terrain) and ("terrain" in xml_path.name.lower())
     else:
-        uses_terrain = task.terrain_type not in ("flat",)
+        uses_terrain = not is_flat_terrain
         xml_key = "xml_terrain" if uses_terrain else "xml_flat"
         xml_path = asset_dir / robot_cfg[xml_key]
         if not xml_path.exists():
@@ -1064,10 +1219,10 @@ def main() -> None:
         except Exception as e:
             print(f"[Warning] Failed to parse --config-override: {e}")
 
-    # For course terrain, generate a temporary XML with box geoms before loading.
+    # For legacy course terrain, generate a temporary XML with box geoms before loading.
     course_spawn_z = 0.0
     _tmp_xml: Path | None = None
-    if uses_terrain and task.terrain_type == "course" and (not bool(args.skip_terrain_inject)):
+    if uses_terrain and getattr(task, "terrain_type", None) == "course" and (not bool(args.skip_terrain_inject)):
         xml_path, course_spawn_z = _generate_course_xml(xml_path, task)
         _tmp_xml = xml_path
         uses_terrain = False  # terrain is already baked into the XML
@@ -1094,6 +1249,11 @@ def main() -> None:
 
     # Velocity override
     velocity = tuple(args.velocity) if args.velocity else None
+
+    policy_dt = float(getattr(simulator, "policy_dt", 0.02))
+    max_episode_steps = max(1, int(np.ceil(float(task.duration) / policy_dt)))
+    if args.max_steps is not None:
+        max_episode_steps = int(args.max_steps)
 
     # Run
     if args.render or args.deploy:
@@ -1124,6 +1284,7 @@ def main() -> None:
             output_dir=args.output_dir,
             video_steps=args.video_steps,
             velocity=velocity,
+            max_steps=max_episode_steps,
         )
         print(f"\nTask: {summary['task']}")
         print(f"  Episodes:         {summary['num_episodes']}")

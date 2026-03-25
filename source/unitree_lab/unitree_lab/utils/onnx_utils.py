@@ -16,10 +16,19 @@ The metadata enables MuJoCo sim2sim by providing:
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+
+def _list_to_csv_str(arr, *, decimals: int = 3, delimiter: str = ",") -> str:
+    fmt = f"{{:.{decimals}f}}"
+    return delimiter.join(
+        fmt.format(x) if isinstance(x, (int, float)) else str(x)
+        for x in arr  # numbers → format, strings → as-is
+    )
 
 
 def build_obs_spec(env) -> dict:
@@ -306,54 +315,102 @@ def build_onnx_metadata(env) -> dict:
     return metadata
 
 
+def _attach_onnx_metadata_from_training_env(env, run_path: str, path: str, filename: str = "policy.onnx") -> None:
+    """Attach env.onnx_metadata + run_path to an exported ONNX (training env API)."""
+    try:
+        import onnx
+    except ImportError:
+        print("[Warning] onnx package not installed, skipping metadata attachment")
+        return
+
+    onnx_path = os.path.join(path, filename)
+    model = onnx.load(onnx_path)
+
+    entry = onnx.StringStringEntryProto()
+    entry.key = "run_path"
+    entry.value = run_path
+    model.metadata_props.append(entry)
+
+    onnx_meta = getattr(env, "onnx_metadata", None) or {}
+    full_metadata = {"run_path": run_path, **onnx_meta}
+
+    entry = onnx.StringStringEntryProto()
+    entry.key = "metadata_json"
+    entry.value = json.dumps(full_metadata, ensure_ascii=False)
+    model.metadata_props.append(entry)
+
+    for k, v in onnx_meta.items():
+        entry = onnx.StringStringEntryProto()
+        entry.key = k
+        if v is None:
+            entry.value = "null"
+        elif isinstance(v, list):
+            entry.value = _list_to_csv_str(v)
+        elif isinstance(v, dict):
+            entry.value = json.dumps(v)
+        else:
+            entry.value = str(v)
+        model.metadata_props.append(entry)
+
+    onnx.save(model, onnx_path)
+    print(f"[ONNX] Attached training metadata to {onnx_path}")
+
+
 def attach_onnx_metadata(
-    onnx_path: str | Path,
-    metadata: dict,
+    onnx_path_or_env: str | Path | Any,
+    metadata_or_run_path: dict | str | None = None,
     output_path: str | Path | None = None,
-) -> str:
+    *,
+    path: str | None = None,
+    filename: str | None = None,
+) -> str | None:
     """Attach metadata to ONNX model.
-    
-    Args:
-        onnx_path: Path to input ONNX file
-        metadata: Metadata dictionary to attach
-        output_path: Output path (default: overwrite input)
-        
-    Returns:
-        Path to output ONNX file
+
+    Supports two call styles:
+
+    1. Path style (original): ``attach_onnx_metadata(onnx_path, metadata_dict, output_path=None)``
+    2. Training env style: ``attach_onnx_metadata(env, run_path, path=..., filename=...)``
     """
+    if path is not None:
+        if filename is None:
+            filename = "policy.onnx"
+        run_path = metadata_or_run_path if isinstance(metadata_or_run_path, str) else ""
+        _attach_onnx_metadata_from_training_env(onnx_path_or_env, run_path, path, filename)
+        return os.path.join(path, filename)
+
+    if metadata_or_run_path is None or not isinstance(metadata_or_run_path, dict):
+        print("[Warning] attach_onnx_metadata: expected metadata dict for path-style call")
+        return str(onnx_path_or_env)
+
+    onnx_path = Path(onnx_path_or_env)
+    metadata = metadata_or_run_path
+    if output_path is None:
+        output_path = onnx_path
+    output_path = Path(output_path)
+
     try:
         import onnx
     except ImportError:
         print("[Warning] onnx package not installed, skipping metadata attachment")
         return str(onnx_path)
-    
-    onnx_path = Path(onnx_path)
-    if output_path is None:
-        output_path = onnx_path
-    output_path = Path(output_path)
-    
-    # Load model
+
     model = onnx.load(str(onnx_path))
-    
-    # Add metadata
+
     metadata_json = json.dumps(metadata)
-    
-    # Remove existing metadata_json if present
+
     for prop in list(model.metadata_props):
         if prop.key == "metadata_json":
             model.metadata_props.remove(prop)
-    
-    # Add new metadata
+
     meta = model.metadata_props.add()
     meta.key = "metadata_json"
     meta.value = metadata_json
-    
-    # Save
+
     onnx.save(model, str(output_path))
-    
+
     print(f"[ONNX] Attached metadata to {output_path}")
     print(f"       Keys: {list(metadata.keys())}")
-    
+
     return str(output_path)
 
 

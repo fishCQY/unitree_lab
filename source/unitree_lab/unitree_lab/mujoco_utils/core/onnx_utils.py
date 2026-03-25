@@ -2,15 +2,10 @@
 
 This module handles:
 1. Loading ONNX models with onnxruntime
-2. Parsing IsaacLab metadata from ONNX files
-3. Managing inference with hidden states (GRU/LSTM)
-
-The metadata_json in ONNX contains critical information:
-- joint_names: Action output order
-- action_scale: Per-joint action scaling
-- default_joint_pos: Default positions for offset
-- observation_names/dims: Obs structure for alignment
-- height_scan_size/resolution: Exteroception config
+2. Parsing IsaacLab metadata from ONNX files (returns plain dict)
+3. Detecting policy type (feedforward / recurrent / transformer)
+4. Initializing hidden states for recurrent policies
+5. Managing inference with hidden states (GRU/LSTM/Transformer)
 """
 
 from __future__ import annotations
@@ -27,139 +22,179 @@ try:
 except ImportError:
     ort = None
 
+try:
+    import onnx as _onnx_lib
+except ImportError:
+    _onnx_lib = None
+
+
+def get_onnx_config(onnx_path: str | Path) -> dict:
+    """Extract configuration from ONNX model metadata.
+
+    Parsing priority:
+    1. ``metadata_json`` field (complete JSON dump)
+    2. Individual fields with JSON / CSV / string parsing
+
+    Args:
+        onnx_path: Path to ONNX model file.
+
+    Returns:
+        Dictionary containing parsed configuration values.
+    """
+    onnx_path = str(onnx_path)
+
+    if _onnx_lib is not None:
+        model = _onnx_lib.load(onnx_path)
+        meta = model.metadata_props
+    elif ort is not None:
+        session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        meta_map = session.get_modelmeta().custom_metadata_map
+
+        class _FakeProp:
+            def __init__(self, k, v):
+                self.key = k
+                self.value = v
+
+        meta = [_FakeProp(k, v) for k, v in meta_map.items()]
+    else:
+        raise ImportError("Neither onnx nor onnxruntime is installed")
+
+    for p in meta:
+        if p.key == "metadata_json":
+            try:
+                config = json.loads(p.value)
+                return config
+            except json.JSONDecodeError:
+                break
+
+    config: dict[str, Any] = {}
+    for p in meta:
+        key = p.key
+        value = p.value
+        if key == "metadata_json":
+            continue
+        try:
+            config[key] = json.loads(value)
+        except json.JSONDecodeError:
+            if "," in value:
+                try:
+                    config[key] = [float(x) for x in value.split(",")]
+                except ValueError:
+                    config[key] = value.split(",")
+            else:
+                config[key] = value
+
+    return config
+
+
+def detect_policy_type(ort_session: "ort.InferenceSession") -> str:
+    """Detect the policy architecture from ONNX model inputs/outputs.
+
+    Returns:
+        One of ``"transformer"``, ``"recurrent"`` (GRU/LSTM), or ``"feedforward"``.
+    """
+    input_names = {inp.name for inp in ort_session.get_inputs()}
+    if "obs_buffer" in input_names and "valid_len" in input_names:
+        return "transformer"
+    output_names = [out.name for out in ort_session.get_outputs()]
+    if len(output_names) > 1:
+        return "recurrent"
+    return "feedforward"
+
+
+def init_hidden_states(
+    ort_session: "ort.InferenceSession",
+) -> tuple[np.ndarray | None, np.ndarray | None, bool]:
+    """Initialize hidden states for recurrent policies.
+
+    Transformer policies are detected separately via :func:`detect_policy_type`
+    and managed by the simulator.
+
+    Returns:
+        Tuple of (hidden_state, cell_state, is_recurrent).
+    """
+    policy_type = detect_policy_type(ort_session)
+
+    hidden_state = None
+    cell_state = None
+    is_recurrent = policy_type == "recurrent"
+
+    if is_recurrent:
+        for input_info in ort_session.get_inputs()[1:]:
+            if "h_in" in input_info.name:
+                hidden_state = np.zeros(input_info.shape, dtype=np.float32)
+            elif "c_in" in input_info.name:
+                cell_state = np.zeros(input_info.shape, dtype=np.float32)
+
+    return hidden_state, cell_state, is_recurrent
+
+
+# ---------------------------------------------------------------------------
+# Legacy OnnxConfig dataclass — kept for backward compatibility.
+# New code should use ``get_onnx_config()`` which returns a plain dict.
+# ---------------------------------------------------------------------------
 
 @dataclass
 class OnnxConfig:
-    """Configuration extracted from ONNX metadata."""
-    
-    # Core policy info
+    """Configuration extracted from ONNX metadata (DEPRECATED — use dict)."""
+
     input_dim: int = 0
     output_dim: int = 0
-    
-    # Joint configuration (action order)
     joint_names: list[str] = field(default_factory=list)
     action_scale: list[float] = field(default_factory=list)
     action_offset: list[float] = field(default_factory=list)
     default_joint_pos: list[float] = field(default_factory=list)
-    
-    # PD gains
     joint_stiffness: list[float] = field(default_factory=list)
     joint_damping: list[float] = field(default_factory=list)
     joint_armature: list[float] = field(default_factory=list)
     tau_limits: list[float] = field(default_factory=list)
-    
-    # Observation structure
     observation_names: list[str] = field(default_factory=list)
     observation_dims: list[int] = field(default_factory=list)
     observation_scales: dict[str, float] = field(default_factory=dict)
-    
-    # History stacking (for obs with temporal context)
-    history_length: int = 1  # Number of stacked frames
-    single_frame_dims: dict[str, int] = field(default_factory=dict)  # Single-frame dim per term
-    # IsaacLab (ManagerBased env) history stacking order is oldest-first along the feature dimension.
-    # We keep an override knob for compatibility with other exporters.
-    history_newest_first: bool = False  # Stack order for history terms
-    
-    # Height scan config
+    history_length: int = 1
+    single_frame_dims: dict[str, int] = field(default_factory=dict)
+    history_newest_first: bool = False
     height_scan_size: tuple[float, float] | None = None
     height_scan_resolution: float = 0.1
     height_scan_offset: float = 0.5
-    
-    # Physics params
     armature: dict[str, float] = field(default_factory=dict)
     damping: dict[str, float] = field(default_factory=dict)
     friction: dict[str, float] = field(default_factory=dict)
-    
-    # Timing
-    policy_dt: float = 0.02  # decimation * sim_dt
+    policy_dt: float = 0.02
     decimation: int = 4
     sim_dt: float = 0.005
-    
-    # Hidden state (RNN)
     has_hidden_state: bool = False
     hidden_state_dim: int = 0
-    
-    # Raw metadata for extensibility
     raw_metadata: dict = field(default_factory=dict)
 
 
-def get_onnx_config(onnx_path: str | Path) -> OnnxConfig:
-    """Extract configuration from ONNX model metadata.
-    
-    Args:
-        onnx_path: Path to ONNX model file
-        
-    Returns:
-        OnnxConfig with parsed metadata
+def get_onnx_config_dataclass(onnx_path: str | Path) -> OnnxConfig:
+    """Legacy helper — returns an :class:`OnnxConfig` dataclass.
+
+    Prefer :func:`get_onnx_config` (returns dict) for new code.
     """
-    if ort is None:
-        raise ImportError("onnxruntime not installed. Run: pip install onnxruntime")
-    
-    onnx_path = Path(onnx_path)
-    if not onnx_path.exists():
-        raise FileNotFoundError(f"ONNX file not found: {onnx_path}")
-    
-    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    
-    config = OnnxConfig()
-    
-    # Get input/output dims
-    inputs = session.get_inputs()
-    outputs = session.get_outputs()
-    
-    if inputs:
-        config.input_dim = inputs[0].shape[-1] if inputs[0].shape else 0
-        config.has_hidden_state = len(inputs) > 1
-        if config.has_hidden_state and len(inputs) > 1:
-            config.hidden_state_dim = inputs[1].shape[-1] if inputs[1].shape else 0
-    
-    if outputs:
-        config.output_dim = outputs[0].shape[-1] if outputs[0].shape else 0
-    
-    # Parse metadata
-    metadata = session.get_modelmeta().custom_metadata_map
-    
-    if "metadata_json" in metadata:
-        try:
-            meta_dict = json.loads(metadata["metadata_json"])
-            config.raw_metadata = meta_dict
-            _parse_metadata_dict(config, meta_dict)
-        except json.JSONDecodeError as e:
-            print(f"Warning: Failed to parse metadata_json: {e}")
-    
-    # Also check deploy.yaml style keys (individual metadata fields)
-    for key, value in metadata.items():
-        if key == "metadata_json":
-            continue
-        try:
-            parsed = json.loads(value)
-            if key == "joint_names":
-                config.joint_names = parsed
-            elif key == "action_scale":
-                config.action_scale = parsed
-            elif key == "default_joint_pos":
-                config.default_joint_pos = parsed
-            elif key == "observation_names":
-                config.observation_names = parsed
-            elif key == "observation_dims":
-                config.observation_dims = parsed
-            elif key == "history_length":
-                config.history_length = parsed
-            elif key == "single_frame_dims":
-                config.single_frame_dims = parsed
-            elif key == "num_actions":
-                config.output_dim = parsed
-            elif key == "total_obs_dim":
-                config.input_dim = parsed
-        except (json.JSONDecodeError, TypeError):
-            pass
-    
-    return config
+    raw = get_onnx_config(onnx_path)
+    cfg = OnnxConfig()
+    cfg.raw_metadata = raw
+
+    if ort is not None:
+        session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        inputs = session.get_inputs()
+        outputs = session.get_outputs()
+        if inputs:
+            cfg.input_dim = inputs[0].shape[-1] if inputs[0].shape else 0
+            cfg.has_hidden_state = len(inputs) > 1
+            if cfg.has_hidden_state and len(inputs) > 1:
+                cfg.hidden_state_dim = inputs[1].shape[-1] if inputs[1].shape else 0
+        if outputs:
+            cfg.output_dim = outputs[0].shape[-1] if outputs[0].shape else 0
+
+    _parse_metadata_dict_into_dataclass(cfg, raw)
+    return cfg
 
 
-def _parse_metadata_dict(config: OnnxConfig, meta: dict) -> None:
-    """Parse metadata dictionary into config."""
-    # Joint configuration
+def _parse_metadata_dict_into_dataclass(config: OnnxConfig, meta: dict) -> None:
+    """Populate an OnnxConfig dataclass from a metadata dict."""
     if "joint_names" in meta:
         config.joint_names = meta["joint_names"]
     if "action_scale" in meta:
@@ -168,16 +203,12 @@ def _parse_metadata_dict(config: OnnxConfig, meta: dict) -> None:
         config.action_offset = meta["action_offset"]
     if "default_joint_pos" in meta:
         config.default_joint_pos = meta["default_joint_pos"]
-    
-    # PD gains
     if "joint_stiffness" in meta:
         config.joint_stiffness = meta["joint_stiffness"]
     if "joint_damping" in meta:
         config.joint_damping = meta["joint_damping"]
     if "tau_limits" in meta:
         config.tau_limits = meta["tau_limits"]
-    
-    # Observation structure
     if "observation_names" in meta:
         config.observation_names = meta["observation_names"]
     if "observation_dims" in meta:
@@ -189,10 +220,7 @@ def _parse_metadata_dict(config: OnnxConfig, meta: dict) -> None:
     if "single_frame_dims" in meta:
         config.single_frame_dims = meta["single_frame_dims"]
     if "history_newest_first" in meta:
-        # Allow explicit override via metadata for non-IsaacLab exporters.
         config.history_newest_first = bool(meta["history_newest_first"])
-    
-    # Height scan
     if "height_scan_size" in meta:
         size = meta["height_scan_size"]
         config.height_scan_size = (size[0], size[1]) if isinstance(size, list) else size
@@ -200,109 +228,133 @@ def _parse_metadata_dict(config: OnnxConfig, meta: dict) -> None:
         config.height_scan_resolution = meta["height_scan_resolution"]
     if "height_scan_offset" in meta:
         config.height_scan_offset = meta["height_scan_offset"]
-    
-    # Physics
     if "armature" in meta:
         config.armature = meta["armature"]
     if "damping" in meta:
         config.damping = meta["damping"]
     if "friction" in meta:
         config.friction = meta["friction"]
-    
-    # Timing
     if "policy_dt" in meta:
         config.policy_dt = meta["policy_dt"]
     if "decimation" in meta:
         config.decimation = meta["decimation"]
     if "sim_dt" in meta:
         config.sim_dt = meta["sim_dt"]
+    if "num_actions" in meta:
+        config.output_dim = meta["num_actions"]
+    if "total_obs_dim" in meta:
+        config.input_dim = meta["total_obs_dim"]
 
 
-def load_onnx_model(onnx_path: str | Path, device: str = "cpu") -> ort.InferenceSession:
-    """Load ONNX model for inference.
-    
-    Args:
-        onnx_path: Path to ONNX file
-        device: Device for inference ("cpu" or "cuda")
-        
-    Returns:
-        ONNX inference session
-    """
+# ---------------------------------------------------------------------------
+# ONNX inference helpers
+# ---------------------------------------------------------------------------
+
+def load_onnx_model(onnx_path: str | Path, device: str = "cpu") -> "ort.InferenceSession":
+    """Load ONNX model for inference."""
     if ort is None:
         raise ImportError("onnxruntime not installed")
-    
     providers = ["CPUExecutionProvider"]
     if device == "cuda":
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    
     return ort.InferenceSession(str(onnx_path), providers=providers)
 
 
 class OnnxInference:
-    """ONNX inference wrapper with hidden state management.
-    
-    Supports both feedforward and recurrent (GRU/LSTM) policies.
-    """
-    
+    """ONNX inference wrapper supporting feedforward / GRU / LSTM / Transformer."""
+
     def __init__(self, onnx_path: str | Path, device: str = "cpu"):
-        """Initialize inference session.
-        
-        Args:
-            onnx_path: Path to ONNX model
-            device: Inference device
-        """
         self.session = load_onnx_model(onnx_path, device)
         self.config = get_onnx_config(onnx_path)
-        
-        # Get input/output names
+
         self.input_names = [inp.name for inp in self.session.get_inputs()]
         self.output_names = [out.name for out in self.session.get_outputs()]
-        
-        # Initialize hidden state if needed
+
+        self.policy_type = detect_policy_type(self.session)
+        self.is_recurrent = self.policy_type == "recurrent"
+        self.is_transformer = self.policy_type == "transformer"
+        self.has_exteroception_input = "exteroception" in self.input_names
+
         self._hidden_state: np.ndarray | None = None
-        if self.config.has_hidden_state:
-            self.reset_hidden_state()
-    
+        self._cell_state: np.ndarray | None = None
+        self._tf_obs_buffer: np.ndarray | None = None
+        self._tf_valid_len: np.ndarray | None = None
+
+        if self.is_recurrent:
+            self._hidden_state, self._cell_state, _ = init_hidden_states(self.session)
+        elif self.is_transformer:
+            for inp in self.session.get_inputs():
+                if inp.name == "obs_buffer":
+                    self._tf_obs_buffer = np.zeros(inp.shape, dtype=np.float32)
+                elif inp.name == "valid_len":
+                    self._tf_valid_len = np.zeros(inp.shape, dtype=np.int64)
+
     def reset_hidden_state(self) -> None:
-        """Reset hidden state to zeros."""
-        if self.config.has_hidden_state and self.config.hidden_state_dim > 0:
-            self._hidden_state = np.zeros(
-                (1, self.config.hidden_state_dim), 
-                dtype=np.float32
-            )
-    
-    def infer(self, obs: np.ndarray) -> np.ndarray:
-        """Run inference on observation.
-        
+        """Reset all hidden / recurrent / transformer states to zero."""
+        if self._hidden_state is not None:
+            self._hidden_state.fill(0)
+        if self._cell_state is not None:
+            self._cell_state.fill(0)
+        if self._tf_obs_buffer is not None:
+            self._tf_obs_buffer.fill(0)
+        if self._tf_valid_len is not None:
+            self._tf_valid_len.fill(0)
+
+    def infer(
+        self,
+        obs: np.ndarray,
+        exteroception: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Run inference.
+
         Args:
-            obs: Observation array of shape (obs_dim,) or (1, obs_dim)
-            
+            obs: Observation array of shape ``(obs_dim,)`` or ``(1, obs_dim)``.
+            exteroception: Optional exteroception tensor.
+
         Returns:
-            Action array of shape (action_dim,)
+            Action array of shape ``(action_dim,)``.
         """
-        # Ensure batch dimension
         if obs.ndim == 1:
             obs = obs.reshape(1, -1)
         obs = obs.astype(np.float32)
-        
-        # Build input dict
-        inputs = {self.input_names[0]: obs}
-        
-        # Add hidden state if recurrent
-        if self.config.has_hidden_state and self._hidden_state is not None:
-            if len(self.input_names) > 1:
-                inputs[self.input_names[1]] = self._hidden_state
-        
-        # Run inference
-        outputs = self.session.run(self.output_names, inputs)
-        
-        # Update hidden state if output
-        if len(outputs) > 1 and self.config.has_hidden_state:
-            self._hidden_state = outputs[1]
-        
-        # Return action (remove batch dim)
-        return outputs[0].squeeze(0)
-    
-    def __call__(self, obs: np.ndarray) -> np.ndarray:
-        """Alias for infer."""
-        return self.infer(obs)
+
+        if self.is_transformer:
+            ort_inputs = {
+                "obs": obs,
+                "obs_buffer": self._tf_obs_buffer,
+                "valid_len": self._tf_valid_len,
+            }
+            ort_outputs = self.session.run(None, ort_inputs)
+            action = ort_outputs[0][0]
+            self._tf_obs_buffer[:] = ort_outputs[1]
+            self._tf_valid_len[:] = ort_outputs[2]
+        elif self.is_recurrent:
+            if self._cell_state is not None:  # LSTM
+                ort_inputs = {
+                    "obs": obs,
+                    "h_in": self._hidden_state,
+                    "c_in": self._cell_state,
+                }
+                if self.has_exteroception_input and exteroception is not None:
+                    ort_inputs["exteroception"] = exteroception.reshape(1, *exteroception.shape)
+                ort_outputs = self.session.run(None, ort_inputs)
+                action = ort_outputs[0][0]
+                self._hidden_state[:] = ort_outputs[1]
+                self._cell_state[:] = ort_outputs[2]
+            else:  # GRU
+                ort_inputs = {"obs": obs, "h_in": self._hidden_state}
+                if self.has_exteroception_input and exteroception is not None:
+                    ort_inputs["exteroception"] = exteroception.reshape(1, *exteroception.shape)
+                ort_outputs = self.session.run(None, ort_inputs)
+                action = ort_outputs[0][0]
+                self._hidden_state[:] = ort_outputs[1]
+        else:
+            ort_inputs = {"obs": obs}
+            if self.has_exteroception_input and exteroception is not None:
+                ort_inputs["exteroception"] = exteroception.reshape(1, *exteroception.shape)
+            action = self.session.run(None, ort_inputs)[0][0]
+
+        return np.clip(action, -100.0, 100.0)
+
+    def __call__(self, obs: np.ndarray, exteroception: np.ndarray | None = None) -> np.ndarray:
+        return self.infer(obs, exteroception)

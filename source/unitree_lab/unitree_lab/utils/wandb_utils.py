@@ -16,9 +16,11 @@ Design Philosophy:
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -493,6 +495,48 @@ class WandbFileSaver:
             "logs/*",
             "data/*",
         ]
+        self._code_snapshot_saved = False
+
+    def save_python_files(self) -> None:
+        """Upload key Python sources to the active W&B run (once per run)."""
+        if self._code_snapshot_saved:
+            return
+        try:
+            import wandb
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+        try:
+            sys.stdout.flush()
+            print("[WandbFileSaver] Saving code snapshot to wandb...")
+            sys.stdout.flush()
+            pkg_root = Path(__file__).resolve().parent.parent
+            source_unitree = pkg_root.parent
+            repo_root = source_unitree.parent.parent
+            rsl_rl_pkg = repo_root / "rsl_rl"
+            dirs_to_save = [
+                (pkg_root, source_unitree),
+                (rsl_rl_pkg, repo_root),
+                (repo_root / "scripts", repo_root),
+            ]
+            total_saved = 0
+            for scan_dir, base_path in dirs_to_save:
+                if not scan_dir.is_dir():
+                    continue
+                for py_file in glob.glob(str(scan_dir / "**" / "*.py"), recursive=True):
+                    try:
+                        wandb.save(py_file, base_path=str(base_path), policy="now")
+                        total_saved += 1
+                    except Exception as e:
+                        rel = os.path.relpath(py_file, base_path)
+                        print(f"  [WandbFileSaver] skip {rel}: {e}")
+            print(f"[WandbFileSaver] Saved {total_saved} Python files")
+            sys.stdout.flush()
+            self._code_snapshot_saved = True
+        except Exception as e:
+            print(f"[WandbFileSaver] Warning: {e}")
+            sys.stdout.flush()
     
     def save_directory(
         self,
@@ -540,6 +584,59 @@ class WandbFileSaver:
         
         print(f"[WandB] Saved {count} files from {directory}")
         return count
+
+    def save_python_files(self):
+        """Save all project Python files to wandb for reproducibility.
+
+        Automatic code snapshot for reproducibility.
+        """
+        if getattr(self, "_py_saved", False):
+            return
+        try:
+            import wandb
+        except ImportError:
+            return
+
+        if wandb.run is None:
+            return
+
+        try:
+            import glob
+            import sys
+
+            sys.stdout.flush()
+            print("[WandbFileSaver] Starting to save code files...")
+            sys.stdout.flush()
+
+            unitree_lab_pkg = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            source_dir = os.path.dirname(os.path.dirname(unitree_lab_pkg))
+            training_root = os.path.dirname(source_dir)
+
+            dirs_to_save = [
+                (unitree_lab_pkg, os.path.dirname(unitree_lab_pkg)),
+                (os.path.join(training_root, "rsl_rl"), training_root),
+                (os.path.join(training_root, "scripts"), training_root),
+            ]
+
+            total_saved = 0
+            total_found = 0
+            for scan_dir, base_path in dirs_to_save:
+                if not os.path.isdir(scan_dir):
+                    continue
+                py_files = glob.glob(os.path.join(scan_dir, "**/*.py"), recursive=True)
+                total_found += len(py_files)
+                for py_file in py_files:
+                    try:
+                        wandb.save(py_file, base_path=base_path, policy="now")
+                        total_saved += 1
+                    except Exception:
+                        pass
+
+            print(f"[WandbFileSaver] Saved {total_saved}/{total_found} Python files")
+            sys.stdout.flush()
+            self._py_saved = True
+        except Exception as e:
+            print(f"[WandbFileSaver] Warning: Failed to save code: {e}")
 
 
 # Convenience functions

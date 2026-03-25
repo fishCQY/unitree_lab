@@ -1,22 +1,21 @@
 """Base MuJoCo simulator for Sim2Sim policy evaluation.
 
-This module provides the core simulation loop:
-1. Load MuJoCo model and ONNX policy
-2. Build observations matching IsaacLab semantics
-3. Apply PD control from policy outputs
-4. Step physics at correct frequency
+Architecture aligned with bfm_training: ABC base class with explicit PD control.
 
-Key alignment points:
-- Joint order mapping (ONNX -> MuJoCo actuator order)
-- Action semantics (scale, offset, position vs velocity)
-- Observation semantics (per-term scale, clip, history)
-- Timing (sim_dt, decimation, policy_dt)
+Key design:
+- Abstract base class — subclasses implement build_observation() and reset()
+- Explicit PD control: torques computed in Python, written to data.ctrl
+- Supports feedforward / GRU / LSTM / Transformer / exteroception policies
+- Actuator sensor support for parallel-mechanism robots
+- Wheel / legged detection from XML joint names
+- Contact parameter alignment with IsaacLab/PhysX
 """
 
 from __future__ import annotations
 
+import contextlib
+from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
@@ -26,439 +25,198 @@ try:
 except ImportError:
     mujoco = None
 
-from ..core.onnx_utils import OnnxConfig, OnnxInference, get_onnx_config
-from ..core.physics import pd_control, pd_control_velocity, apply_onnx_physics_params
-from ..core.xml_parsing import (
-    build_joint_mapping,
-    get_actuator_names,
-    get_ctrl_ranges,
-    parse_actuators_from_xml,
-)
-from .observation_builder import ObservationBuilder
+try:
+    import onnxruntime as ort
+except ImportError:
+    ort = None
+
+from ..core.onnx_utils import detect_policy_type, get_onnx_config, init_hidden_states
+from ..core.physics import apply_onnx_physics_params, get_tau_limit, pd_control
+from ..core.xml_parsing import parse_actuators_from_xml
 
 
-class BaseMujocoSimulator:
-    """Base simulator for MuJoCo sim2sim evaluation.
-    
-    This class handles:
-    - Loading and configuring MuJoCo model
-    - Loading ONNX policy with metadata
-    - Joint mapping between ONNX and MuJoCo
-    - PD control with correct gains/limits
-    - Observation construction
-    - Simulation stepping at correct frequency
-    
-    Subclass this for task-specific simulators (locomotion, manipulation, etc).
+class BaseMujocoSimulator(ABC):
+    """Abstract base class for MuJoCo simulation with ONNX policy.
+
+    Subclasses must implement:
+    - ``build_observation(**kwargs)`` — return (obs, exteroception_or_None)
+    - ``reset()`` — reset simulation state
+
+    Example::
+
+        class LocomotionSimulator(BaseMujocoSimulator):
+            def build_observation(self, **kwargs):
+                ...
+                return obs, None
+
+            def reset(self):
+                mujoco.mj_resetData(self.model, self.data)
+                ...
     """
-    
-    def __init__(
-        self,
-        xml_path: str | Path,
-        onnx_path: str | Path,
-        config_override: dict[str, Any] | None = None,
-    ):
-        """Initialize simulator.
-        
-        Args:
-            xml_path: Path to MuJoCo XML model
-            onnx_path: Path to ONNX policy
-            config_override: Override config values
-        """
+
+    sim_dt: float = 0.001
+    decimation: int = 20
+
+    def __init__(self, onnx_path: str, mujoco_model_path: str):
         if mujoco is None:
             raise ImportError("mujoco not installed. Run: pip install mujoco")
-        
-        self.xml_path = Path(xml_path)
-        self.onnx_path = Path(onnx_path)
-        
-        # Load ONNX config
+        if ort is None:
+            raise ImportError("onnxruntime not installed. Run: pip install onnxruntime")
+
+        self.onnx_path = onnx_path
+        self.mujoco_model_path = mujoco_model_path
+
+        # Parse ONNX config (returns dict)
         self.onnx_config = get_onnx_config(onnx_path)
-        if config_override:
-            self._apply_config_override(config_override)
-        
-        # Load MuJoCo model
-        self.model = mujoco.MjModel.from_xml_path(str(self.xml_path))
-        self.data = mujoco.MjData(self.model)
+        self.joint_names = self.onnx_config.get("joint_names", [])
+        self.num_actions = self.onnx_config.get("num_actions", 0) or len(self.joint_names)
+        self.action_scale = np.array(self.onnx_config.get("action_scale", [0.25] * self.num_actions))
+        self.default_joint_pos = np.array(self.onnx_config.get("default_joint_pos", [0.0] * self.num_actions))
 
-        # Determine the body id associated with the floating base (if any).
-        # For free joints, MuJoCo's generalized velocities (qvel) are not a reliable
-        # source for spatial base velocities across models; instead we use data.cvel
-        # for the body that owns the free joint.
-        self._base_body_id: int | None = None
-        try:
-            # Find first free joint (jnt_type == 0) and use its owning body.
-            free_joints = np.where(np.asarray(self.model.jnt_type, dtype=np.int32) == 0)[0]
-            if free_joints.size > 0:
-                jid0 = int(free_joints[0])
-                self._base_body_id = int(self.model.jnt_bodyid[jid0])
-        except Exception:
-            self._base_body_id = None
+        # Parse actuators from XML
+        self.joint_xml = parse_actuators_from_xml(mujoco_model_path)
+        self.is_wheel_mask = np.array(["wheel" in joint for joint in self.joint_xml])
+        self.is_legged = not any("wheel" in joint for joint in self.joint_xml)
 
-        # Optional spawn adjustment for heightfield terrains (set by sim2sim runner).
-        # If >0, we will lift the floating base root z on every reset to avoid initial
-        # interpenetration with raised terrains.
-        self.spawn_root_z_offset: float = 0.0
-        
-        # Configure timing
-        self.sim_dt = self.onnx_config.sim_dt
-        self.decimation = self.onnx_config.decimation
-        self.policy_dt = self.sim_dt * self.decimation
+        # Create joint mapping (ONNX name -> MuJoCo actuator index)
+        if self.joint_names and self.joint_xml:
+            self.joint_mapping_index = np.array(
+                [self.joint_names.index(joint) for joint in self.joint_xml]
+            )
+        else:
+            self.joint_mapping_index = np.arange(self.num_actions)
+
+        # Get PD gains in MuJoCo actuator order
+        p_gains_seq = np.array(self.onnx_config.get("joint_stiffness", [100.0] * self.num_actions))
+        self.p_gains = self._model_to_mujoco(p_gains_seq, self.joint_mapping_index)
+        d_gains_seq = np.array(self.onnx_config.get("joint_damping", [10.0] * self.num_actions))
+        self.d_gains = self._model_to_mujoco(d_gains_seq, self.joint_mapping_index)
+
+        # Initialize ONNX runtime session
+        self.ort_session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        self.policy_type = detect_policy_type(self.ort_session)
+        self.is_recurrent = self.policy_type == "recurrent"
+        self.is_transformer = self.policy_type == "transformer"
+
+        if self.is_recurrent:
+            self.hidden_state, self.cell_state, _ = init_hidden_states(self.ort_session)
+        else:
+            self.hidden_state = None
+            self.cell_state = None
+
+        # Transformer state
+        self._tf_obs_buffer: np.ndarray | None = None
+        self._tf_valid_len: np.ndarray | None = None
+        if self.is_transformer:
+            for inp in self.ort_session.get_inputs():
+                if inp.name == "obs_buffer":
+                    self._tf_obs_buffer = np.zeros(inp.shape, dtype=np.float32)
+                elif inp.name == "valid_len":
+                    self._tf_valid_len = np.zeros(inp.shape, dtype=np.int64)
+
+        # Exteroception input support
+        input_names = [inp.name for inp in self.ort_session.get_inputs()]
+        self.has_exteroception_input = "exteroception" in input_names
+
+        self.expected_obs_dim = self.ort_session.get_inputs()[0].shape[1]
+
+        # Initialize MuJoCo model and data
+        self.model = mujoco.MjModel.from_xml_path(mujoco_model_path)
         self.model.opt.timestep = self.sim_dt
 
-        # Use implicitfast integrator for stability with stiff PD position servos.
-        # MuJoCo's default Euler integrator is explicit and can become unstable
-        # when high-stiffness joint drives are solved as implicit actuators.
-        # implicitfast handles implicit joint-level forces (Kp, Kd) within the
-        # integration step, matching the behavior of PhysX's TGS solver used by
-        # IsaacLab during training.
-        self.model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
-
-        # Increase solver iterations for humanoid contact stability.
+        # Solver iterations for humanoid contact stability
         self.model.opt.iterations = 50
         self.model.opt.ls_iterations = 50
 
-        # Build robust actuator <-> (joint,qpos,dof) mappings from the loaded MuJoCo model.
-        # This is critical for scene/include XMLs where qpos slices are not aligned with actuator order.
-        self._setup_actuator_state_mapping()
-        
-        # Setup joint mapping
-        self._setup_joint_mapping()
-        
-        # Apply physics params from ONNX
-        self._apply_physics_params()
-        
-        # Setup PD gains
-        self._setup_pd_gains()
+        self.data = mujoco.MjData(self.model)
 
-        # Convert MuJoCo motor actuators to position servos so the PD law is
-        # integrated implicitly by MuJoCo's engine.  This matches the behaviour
-        # of PhysX implicit actuators used by IsaacLab during training – explicit
-        # PD via qfrc_applied is too weak with the same Kp/Kd gains.
-        self._configure_position_servos()
+        # Apply physics parameters from ONNX config
+        apply_onnx_physics_params(self.model, self.onnx_config)
 
-        # Align ground contact parameters with IsaacLab defaults.
+        # Get torque limits from actuator ctrlrange
+        self.tau_limit = get_tau_limit(self.model, self.num_actions)
+
+        # Build actuator sensor indices for parallel mechanism support
+        self.actuator_pos_sensor_indices: np.ndarray = np.array([], dtype=np.int64)
+        self.actuator_vel_sensor_indices: np.ndarray = np.array([], dtype=np.int64)
+        self._build_actuator_sensor_mapping()
+
+        # Align ground contact parameters with IsaacLab defaults
         self._configure_contact_params()
-        
-        # Load policy
-        self.policy = OnnxInference(onnx_path)
-        
-        # Setup observation builder
-        self.obs_builder = ObservationBuilder(
-            model=self.model,
-            data=self.data,
-            onnx_config=self.onnx_config,
-            joint_mapping=self.joint_mapping,
-        )
-        # If ONNX metadata didn't provide default_joint_pos, fall back to the simulator's default pose (ONNX order).
-        if not self.onnx_config.default_joint_pos:
-            self.obs_builder.default_joint_pos = self.default_joint_pos_onnx.copy()
-        
-        # State
-        self.episode_length = 0
-        self.global_phase = 0.0
-        # last_action must be kept in ONNX joint order because it is fed back into observations.
-        self._last_action = np.zeros(self.onnx_action_dim, dtype=np.float32)
-        
-        # Velocity command (for locomotion)
-        self.velocity_command = np.zeros(3)  # [vx, vy, wz]
-        
-        print(f"[Sim2Sim] Initialized simulator:")
-        print(f"  - Model: {self.xml_path.name}")
-        print(f"  - Policy: {self.onnx_path.name}")
-        print(f"  - Num joints: {self.num_actions}")
-        print(f"  - Timing: sim_dt={self.sim_dt}, decimation={self.decimation}, policy_dt={self.policy_dt}")
 
-    def _setup_actuator_state_mapping(self) -> None:
-        """Build mappings to read/write actuator joint states robustly from MuJoCo model.
+        # Default observation scales
+        self.obs_scales = {
+            "dof_pos": 1.0,
+            "dof_vel": 0.2,
+            "ang_vel": 0.2,
+        }
 
-        We derive for each actuator i:
-          - joint id: model.actuator_trnid[i,0]
-          - qpos address: model.jnt_qposadr[jid]
-          - dof address: model.jnt_dofadr[jid]
+        # Current action state (MuJoCo actuator order)
+        self.action = np.zeros(self.num_actions)
 
-        This avoids assuming actuated joints are a contiguous slice in qpos/qvel.
+        print(f"[Sim2Sim] Initialized: {Path(mujoco_model_path).name}, "
+              f"policy_type={self.policy_type}, actions={self.num_actions}")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _model_to_mujoco(model_values: np.ndarray, mapping_index: np.ndarray) -> np.ndarray:
+        """Reorder values from ONNX/model order to MuJoCo actuator order."""
+        result = np.zeros(len(mapping_index))
+        for i, idx in enumerate(mapping_index):
+            result[i] = model_values[idx]
+        return result
+
+    def _build_actuator_sensor_mapping(self) -> None:
+        """Build sensor indices for actuator position/velocity readings.
+
+        Supports parallel mechanism robots where ``qpos[-num_actions:]``
+        doesn't give the correct actuator joint states.
         """
-        model_nu = int(self.model.nu)
-        if model_nu <= 0:
-            raise RuntimeError("[Sim2Sim] MuJoCo model.nu==0 (no actuators).")
-
-        self.num_actions = model_nu
-
-        # Actuator names in model order (preferred; works with <include> scenes).
-        self.actuator_names: list[str] = []
-        self._actuator_joint_ids: list[int] = []
-        self._qpos_adrs: list[int] = []
-        self._dof_adrs: list[int] = []
-        self.tau_limits = np.zeros((self.num_actions, 2), dtype=np.float32)
-
-        for act_id in range(self.num_actions):
-            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, act_id)
-            self.actuator_names.append(name or f"actuator_{act_id}")
-
-            jid = int(self.model.actuator_trnid[act_id, 0])
-            if jid < 0:
-                raise RuntimeError(
-                    f"[Sim2Sim] Actuator '{self.actuator_names[-1]}' has invalid actuator_trnid joint id: {jid}"
-                )
-            self._actuator_joint_ids.append(jid)
-
-            qpos_adr = int(self.model.jnt_qposadr[jid])
-            dof_adr = int(self.model.jnt_dofadr[jid])
-            self._qpos_adrs.append(qpos_adr)
-            self._dof_adrs.append(dof_adr)
-
-            # Torque limits from joint actuation force range (more reliable than actuator ctrlrange).
-            try:
-                self.tau_limits[act_id, :] = self.model.jnt_actfrcrange[jid].astype(np.float32)
-            except Exception:
-                self.tau_limits[act_id, :] = np.array([-np.inf, np.inf], dtype=np.float32)
-
-        # ONNX action dimension (policy output dim). Prefer metadata/output dim; fall back to num_actions.
-        self.onnx_action_dim = int(self.onnx_config.output_dim) if int(self.onnx_config.output_dim or 0) > 0 else self.num_actions
-    
-    def _apply_config_override(self, override: dict[str, Any]) -> None:
-        """Apply configuration overrides."""
-        for key, value in override.items():
-            if hasattr(self.onnx_config, key):
-                setattr(self.onnx_config, key, value)
-    
-    def _setup_joint_mapping(self) -> None:
-        """Setup mapping from MuJoCo actuators to ONNX joints."""
-        # Prefer MuJoCo model actuator names (include-scene safe).
-        model_actuator_names = list(self.actuator_names)
-
-        # Also try parsing actuators from the provided XML (useful when model names are missing).
-        xml_actuator_names: list[str] = []
-        try:
-            xml_actuator_names = get_actuator_names(self.xml_path)
-        except Exception:
-            xml_actuator_names = []
-
-        # Choose the most informative actuator name list.
-        # - If model provides real names, use them.
-        # - If model names are generic and XML parse gives better names, use XML list (if sizes match).
-        use_names = model_actuator_names
-        if xml_actuator_names and len(xml_actuator_names) == len(model_actuator_names):
-            model_generic = all((n.startswith("actuator_") or n == "") for n in model_actuator_names)
-            if model_generic:
-                use_names = xml_actuator_names
-        if not use_names:
-            use_names = model_actuator_names or xml_actuator_names
-        
-        # Get joint names from ONNX
-        onnx_joint_names = self.onnx_config.joint_names
-        
-        if not onnx_joint_names:
-            # If no joint names in metadata, assume same order (ONNX output already matches actuator order).
-            print("[Warning] No joint_names in ONNX metadata, assuming same order as MuJoCo actuators")
-            self.joint_mapping = list(range(len(use_names)))
-        else:
-            self.joint_mapping = build_joint_mapping(onnx_joint_names, use_names)
-
-        if len(self.joint_mapping) != self.num_actions:
-            raise RuntimeError(
-                f"[Sim2Sim] joint_mapping length mismatch: mapping={len(self.joint_mapping)} vs model.nu={self.num_actions}"
+        pos_indices = []
+        vel_indices = []
+        for actuator_name in self.joint_xml:
+            pos_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_SENSOR, f"{actuator_name}_p"
             )
+            vel_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_SENSOR, f"{actuator_name}_v"
+            )
+            if pos_id >= 0 and vel_id >= 0:
+                pos_indices.append(self.model.sensor_adr[pos_id])
+                vel_indices.append(self.model.sensor_adr[vel_id])
 
-        # Inverse mapping: for each ONNX joint index -> actuator index
-        self.inv_joint_mapping = [0] * len(self.joint_mapping)
-        for act_i, onnx_i in enumerate(self.joint_mapping):
-            if onnx_i < 0 or onnx_i >= len(self.inv_joint_mapping):
-                raise RuntimeError(f"[Sim2Sim] Invalid mapping entry: joint_mapping[{act_i}]={onnx_i}")
-            self.inv_joint_mapping[onnx_i] = act_i
-        
-        self.xml_actuator_names = use_names
+        self.actuator_pos_sensor_indices = np.array(pos_indices, dtype=np.int64)
+        self.actuator_vel_sensor_indices = np.array(vel_indices, dtype=np.int64)
+        self.use_sensor_data = len(self.actuator_pos_sensor_indices) == self.num_actions
 
-        # Human-readable mapping for quick sim2sim debugging.
-        # Interpretation: actuator i (MuJoCo application order) corresponds to ONNX joint index j.
-        print(f"[Sim2Sim] Joint mapping (actuator->onnx): {self.joint_mapping}")
-        try:
-            if onnx_joint_names:
-                print("[Sim2Sim] Actuator->ONNX name pairs:")
-                for act_i, onnx_i in enumerate(self.joint_mapping):
-                    act_name = str(use_names[act_i]) if act_i < len(use_names) else f"act_{act_i}"
-                    onnx_name = str(onnx_joint_names[onnx_i]) if 0 <= int(onnx_i) < len(onnx_joint_names) else f"onnx_{onnx_i}"
-                    print(f"  - {act_i:02d}: {act_name}  ->  {onnx_i:02d}: {onnx_name}")
-        except Exception:
-            # Keep mapping robust even if printing fails.
-            pass
-    
-    def _apply_physics_params(self) -> None:
-        """Apply physics parameters from ONNX to MuJoCo model."""
-        apply_onnx_physics_params(
-            self.model,
-            armature=self.onnx_config.armature,
-            damping=self.onnx_config.damping,
-            friction=self.onnx_config.friction,
-        )
-    
-    def _setup_pd_gains(self) -> None:
-        """Setup PD gains from ONNX config or XML."""
-        if self.onnx_config.joint_stiffness:
-            kp_onnx = np.array(self.onnx_config.joint_stiffness)
-            self.kp = kp_onnx[self.joint_mapping]
-        else:
-            self.kp = np.ones(self.num_actions) * 100.0
-        
-        if self.onnx_config.joint_damping:
-            kd_onnx = np.array(self.onnx_config.joint_damping)
-            self.kd = kd_onnx[self.joint_mapping]
-        else:
-            self.kd = np.ones(self.num_actions) * 10.0
-        
-        if self.onnx_config.action_scale:
-            scale_onnx = np.array(self.onnx_config.action_scale)
-            self.action_scale = scale_onnx[self.joint_mapping]
-        else:
-            self.action_scale = np.ones(self.num_actions) * 0.25
-
-        self._action_offset_provided = bool(getattr(self.onnx_config, "action_offset", []))
-
-        if self._action_offset_provided:
-            offset_onnx = np.array(self.onnx_config.action_offset, dtype=np.float32).reshape(-1)
-            if offset_onnx.shape[0] != self.onnx_action_dim:
-                if offset_onnx.shape[0] < self.onnx_action_dim:
-                    offset_onnx = np.concatenate(
-                        [offset_onnx, np.zeros(self.onnx_action_dim - offset_onnx.shape[0], dtype=np.float32)]
-                    )
-                else:
-                    offset_onnx = offset_onnx[: self.onnx_action_dim]
-            self.action_offset = offset_onnx[self.joint_mapping]
-        else:
-            self.action_offset = np.zeros(self.num_actions, dtype=np.float32)
-        
-        if self.onnx_config.default_joint_pos:
-            default_onnx = np.array(self.onnx_config.default_joint_pos)
-            self.default_joint_pos = default_onnx[self.joint_mapping]
-        else:
-            self.default_joint_pos = np.array([self.data.qpos[a] for a in self._qpos_adrs], dtype=np.float32)
-
-        self.default_joint_pos_onnx = self.default_joint_pos[np.array(self.inv_joint_mapping, dtype=np.int64)].copy()
-        
-        print(f"[Sim2Sim] PD gains: Kp={self.kp[:3]}..., Kd={self.kd[:3]}...")
-        print(f"[Sim2Sim] Action scale: {self.action_scale[:3]}...")
-
-    def _configure_position_servos(self) -> None:
-        """Reconfigure MuJoCo motor actuators as position servos.
-
-        IsaacLab trains with PhysX *implicit* PD (joint drives solved inside the
-        constraint solver).  Explicit PD (τ = Kp·e − Kd·dq applied via qfrc_applied)
-        with the *same* gains is far too weak in MuJoCo – the robot collapses under
-        gravity.
-
-        The fix is to turn every motor actuator into a *position servo* so MuJoCo's
-        own integrator handles the PD law:
-
-            force = gainprm[0] * ctrl          (= Kp·q_target)
-                  + biasprm[1] * q_joint       (= −Kp·q_current)
-                  + biasprm[2] * dq_joint      (= −Kd·dq)
-
-        After this, ``data.ctrl[i]`` accepts target joint positions (not torques).
-
-        Additionally, we zero out MuJoCo's native ``dof_damping`` and
-        ``dof_frictionloss`` on actuated joints.  IsaacLab's ImplicitActuator
-        sets friction=0 for all groups, and the PD damping is the *only* velocity
-        dependent force.  Leaving MuJoCo's default XML damping (e.g. 0.05) and
-        friction (e.g. 0.2) active would double-count dissipation, over-damp the
-        joints, and make the observed joint velocities too small compared to what
-        the policy saw during training.
-        """
-        for act_id in range(self.num_actions):
-            jid = self._actuator_joint_ids[act_id]
-            dof_adr = self._dof_adrs[act_id]
-            kp_i = float(self.kp[act_id])
-            kd_i = float(self.kd[act_id])
-
-            self.model.actuator_gaintype[act_id] = 0          # fixed gain
-            self.model.actuator_biastype[act_id] = 1          # affine bias
-            self.model.actuator_gainprm[act_id, :] = 0.0
-            self.model.actuator_gainprm[act_id, 0] = kp_i
-            self.model.actuator_biasprm[act_id, :] = 0.0
-            self.model.actuator_biasprm[act_id, 1] = -kp_i
-            self.model.actuator_biasprm[act_id, 2] = -kd_i
-
-            # Do NOT clip ctrl to joint range. IsaacLab's JointPositionAction
-            # only clips processed actions to a very wide range ([-100, 100] rad)
-            # and lets the PhysX joint limits handle physical constraint. Clipping
-            # to jnt_range reduces the PD position error near limits, producing
-            # weaker corrective forces than what the policy expects.
-            self.model.actuator_ctrllimited[act_id] = 0
-
-            frc_range = self.tau_limits[act_id]
-            if np.isfinite(frc_range).all() and not np.allclose(frc_range, 0):
-                self.model.actuator_forcerange[act_id] = frc_range
-                self.model.actuator_forcelimited[act_id] = 1
-
-            self.model.actuator_dyntype[act_id] = 0           # no dynamics filter
-
-            self.model.dof_damping[dof_adr] = 0.0
-            self.model.dof_frictionloss[dof_adr] = 0.0
-
-        if self.onnx_config.joint_armature:
-            arm_onnx = np.array(self.onnx_config.joint_armature, dtype=np.float64)
-            arm_act = arm_onnx[np.array(self.joint_mapping, dtype=np.int64)]
-            for act_id in range(self.num_actions):
-                self.model.dof_armature[self._dof_adrs[act_id]] = float(arm_act[act_id])
-            print(f"[Sim2Sim] Applied joint_armature from config (first 3: {arm_act[:3]})")
-
-        print("[Sim2Sim] Actuators reconfigured as position servos (implicit PD via data.ctrl)")
-        print("[Sim2Sim] Zeroed dof_damping & dof_frictionloss on actuated joints")
+        if self.use_sensor_data:
+            print("[Sim2Sim] Using actuator sensors for joint state (parallel mechanism support)")
 
     def _configure_contact_params(self) -> None:
-        """Align MuJoCo contact/solver parameters with IsaacLab/PhysX defaults.
-
-        IsaacLab training environment (G1 rough):
-          - terrain physics_material: static_friction=1.0, dynamic_friction=1.0,
-            restitution=1.0, friction_combine_mode="multiply"
-          - PhysX TGS solver with hard contacts and pyramidal friction cone
-          - max_depenetration_velocity=1.0
-
-        MuJoCo differences addressed here:
-          1. Friction cone: switch to pyramidal (PhysX uses pyramid model)
-          2. Robot foot geom friction: set to 1.0 to match Isaac Lab defaults
-          3. Floor geom friction: set to 1.0
-          4. solref/solimp: tuned for harder contacts (closer to PhysX)
-          5. noslip_iterations: prevent contact sliding artifacts
-        """
-        # --- Friction cone model ---
-        # PhysX uses a pyramidal friction cone; MuJoCo defaults to elliptic.
+        """Align MuJoCo contact/solver parameters with IsaacLab/PhysX defaults."""
         self.model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
-
-        # --- noslip solver ---
-        # PhysX's TGS solver enforces no-slip friction constraints more
-        # aggressively than MuJoCo's default solver.  A few noslip iterations
-        # help prevent foot sliding at the cost of a small performance hit.
         self.model.opt.noslip_iterations = 10
 
-        # --- Contact softness (solref / solimp) ---
-        # MuJoCo defaults: solref=[0.02, 1.0], solimp=[0.9, 0.95, 0.001, 0.5, 2]
-        # PhysX contacts are much harder.  We use a shorter time-constant and
-        # higher impedance to reduce ground compliance.
-        HARD_SOLREF = np.array([0.005, 1.0])      # shorter time-constant → stiffer
+        HARD_SOLREF = np.array([0.005, 1.0])
         HARD_SOLIMP = np.array([0.95, 0.99, 0.001, 0.5, 2.0])
 
-        # --- Floor geom ---
         floor_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
         if floor_id >= 0:
             self.model.geom_friction[floor_id] = [1.0, 0.005, 0.0001]
             self.model.geom_solref[floor_id] = HARD_SOLREF
             self.model.geom_solimp[floor_id] = HARD_SOLIMP
 
-        # --- Heightfield geom (terrain scenes) ---
-        hfield_geom_id = -1
         for gid in range(self.model.ngeom):
             if self.model.geom_type[gid] == mujoco.mjtGeom.mjGEOM_HFIELD:
-                hfield_geom_id = gid
+                self.model.geom_friction[gid] = [1.0, 0.005, 0.0001]
+                self.model.geom_solref[gid] = HARD_SOLREF
+                self.model.geom_solimp[gid] = HARD_SOLIMP
                 break
-        if hfield_geom_id >= 0:
-            self.model.geom_friction[hfield_geom_id] = [1.0, 0.005, 0.0001]
-            self.model.geom_solref[hfield_geom_id] = HARD_SOLREF
-            self.model.geom_solimp[hfield_geom_id] = HARD_SOLIMP
 
-        # --- Robot collision geoms ---
-        # Set friction for all robot collidable geoms (body_id > 0) to 1.0
-        # to match Isaac Lab's rigid_body_material defaults.
-        # Also harden their contact parameters.
-        n_robot_geoms_set = 0
+        n_set = 0
         for gid in range(self.model.ngeom):
             body_id = self.model.geom_bodyid[gid]
             if body_id <= 0:
@@ -470,544 +228,407 @@ class BaseMujocoSimulator:
             self.model.geom_friction[gid] = [1.0, 0.005, 0.0001]
             self.model.geom_solref[gid] = HARD_SOLREF
             self.model.geom_solimp[gid] = HARD_SOLIMP
-            n_robot_geoms_set += 1
+            n_set += 1
 
-        print(f"[Sim2Sim] Contact alignment: cone=pyramidal, noslip_iter=10, "
-              f"solref={HARD_SOLREF.tolist()}, robot_geoms_configured={n_robot_geoms_set}")
-    
-    @property
-    def joint_pos(self) -> np.ndarray:
-        """Get current joint positions in ONNX joint order."""
-        q_act = np.array([self.data.qpos[a] for a in self._qpos_adrs], dtype=np.float32)
-        return q_act[np.array(self.inv_joint_mapping, dtype=np.int64)].copy()
+        print(f"[Sim2Sim] Contact: cone=pyramidal, noslip=10, robot_geoms={n_set}")
 
-    @property
-    def joint_pos_actuator(self) -> np.ndarray:
-        """Get current joint positions in MuJoCo actuator order."""
-        return np.array([self.data.qpos[a] for a in self._qpos_adrs], dtype=np.float32)
-    
-    @property
-    def joint_vel(self) -> np.ndarray:
-        """Get current joint velocities in ONNX joint order."""
-        dq_act = np.array([self.data.qvel[a] for a in self._dof_adrs], dtype=np.float32)
-        return dq_act[np.array(self.inv_joint_mapping, dtype=np.int64)].copy()
+    # ------------------------------------------------------------------
+    # Abstract interface
+    # ------------------------------------------------------------------
 
-    @property
-    def joint_vel_actuator(self) -> np.ndarray:
-        """Get current joint velocities in MuJoCo actuator order."""
-        return np.array([self.data.qvel[a] for a in self._dof_adrs], dtype=np.float32)
-    
-    @property
-    def base_pos(self) -> np.ndarray:
-        """Get base position [x, y, z]."""
-        return self.data.qpos[:3].copy()
-    
-    @property
-    def base_quat(self) -> np.ndarray:
-        """Get base quaternion [w, x, y, z]."""
-        return self.data.qpos[3:7].copy()
-    
-    @property
-    def base_lin_vel(self) -> np.ndarray:
-        """Get base linear velocity in world frame.
+    @abstractmethod
+    def build_observation(self, **kwargs) -> tuple[np.ndarray, np.ndarray | None]:
+        """Build observation vector for the policy.
 
-        Uses ``data.cvel`` (refreshed by :meth:`step` via ``mj_forward``).
-        Fallback to ``data.qvel[:3]`` (local frame for free joints – only
-        exact when the base is unrotated).
-        """
-        try:
-            if self._base_body_id is not None:
-                return self.data.cvel[self._base_body_id, 3:6].copy()
-        except Exception:
-            pass
-        return self.data.qvel[:3].copy()
-
-    @property
-    def base_ang_vel(self) -> np.ndarray:
-        """Get base angular velocity in **world** frame.
-
-        Primary source: ``data.cvel`` (refreshed by :meth:`step` via
-        ``mj_forward`` after the decimation loop).
-        Fallback: rotate ``qvel[3:6]`` (body-frame) to world frame.
-        """
-        try:
-            if self._base_body_id is not None:
-                return self.data.cvel[self._base_body_id, 0:3].copy()
-        except Exception:
-            pass
-        # qvel[3:6] for a free joint is in the LOCAL (body) frame.
-        # Rotate to world frame so the caller (ObservationBuilder) can apply
-        # its own world→body rotation consistently.
-        from ..core.physics import quat_to_rotation_matrix
-        R = quat_to_rotation_matrix(self.base_quat)
-        return (R @ self.data.qvel[3:6]).copy()
-    
-    def reset(self, initial_state: dict[str, Any] | None = None) -> np.ndarray:
-        """Reset simulation.
-        
-        Args:
-            initial_state: Optional initial state dict with:
-                - qpos: Full qpos
-                - qvel: Full qvel
-                - joint_pos: Just joint positions
-                
         Returns:
-            Initial observation
+            Tuple of (observation, exteroception_or_None).
         """
-        mujoco.mj_resetData(self.model, self.data)
-        
-        # Track whether we changed joint pose without explicitly setting full qpos.
-        # If so, we will perform a conservative "spawn lift" to avoid starting with
-        # robot geoms interpenetrating the ground due to pose changes (common sim2sim instability source).
-        pose_touched = False
 
-        if initial_state:
-            if "qpos" in initial_state:
-                self.data.qpos[:] = initial_state["qpos"]
-            if "qvel" in initial_state:
-                self.data.qvel[:] = initial_state["qvel"]
-            if "joint_pos" in initial_state:
-                num_free_dof = 7 if self.model.nq > self.num_actions else 0
-                self.data.qpos[num_free_dof:num_free_dof + self.num_actions] = initial_state["joint_pos"]
-                pose_touched = True
+    @abstractmethod
+    def reset(self) -> None:
+        """Reset the simulation state."""
+
+    # ------------------------------------------------------------------
+    # Policy inference
+    # ------------------------------------------------------------------
+
+    def step_inference(
+        self,
+        obs: np.ndarray,
+        exteroception: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Run policy inference to get action.
+
+        Supports feedforward / GRU / LSTM / Transformer / exteroception.
+        """
+        if self.is_transformer:
+            ort_inputs = {
+                "obs": obs.reshape(1, -1).astype(np.float32),
+                "obs_buffer": self._tf_obs_buffer,
+                "valid_len": self._tf_valid_len,
+            }
+            ort_outputs = self.ort_session.run(None, ort_inputs)
+            action = ort_outputs[0][0]
+            self._tf_obs_buffer[:] = ort_outputs[1]
+            self._tf_valid_len[:] = ort_outputs[2]
+        elif self.is_recurrent:
+            assert self.hidden_state is not None
+            if self.cell_state is not None:  # LSTM
+                ort_inputs = {
+                    "obs": obs.reshape(1, -1).astype(np.float32),
+                    "h_in": self.hidden_state,
+                    "c_in": self.cell_state,
+                }
+                if self.has_exteroception_input and exteroception is not None:
+                    ort_inputs["exteroception"] = exteroception.reshape(1, *exteroception.shape).astype(np.float32)
+                ort_outputs = self.ort_session.run(None, ort_inputs)
+                action = ort_outputs[0][0]
+                self.hidden_state[:] = ort_outputs[1]
+                self.cell_state[:] = ort_outputs[2]
+            else:  # GRU
+                ort_inputs = {
+                    "obs": obs.reshape(1, -1).astype(np.float32),
+                    "h_in": self.hidden_state,
+                }
+                if self.has_exteroception_input and exteroception is not None:
+                    ort_inputs["exteroception"] = exteroception.reshape(1, *exteroception.shape).astype(np.float32)
+                ort_outputs = self.ort_session.run(None, ort_inputs)
+                action = ort_outputs[0][0]
+                self.hidden_state[:] = ort_outputs[1]
         else:
-            # Default: set joints to default positions
-            for i, qpos_adr in enumerate(self._qpos_adrs):
-                self.data.qpos[qpos_adr] = float(self.default_joint_pos[i])
-            pose_touched = True
+            ort_inputs = {"obs": obs.reshape(1, -1).astype(np.float32)}
+            if self.has_exteroception_input and exteroception is not None:
+                ort_inputs["exteroception"] = exteroception.reshape(1, *exteroception.shape).astype(np.float32)
+            action = self.ort_session.run(None, ort_inputs)[0][0]
 
-        # If we have a floating base and we're not explicitly overriding qpos, lift the root
-        # to avoid starting with the feet embedded in a raised heightfield.
-        try:
-            has_floating_base = bool(self.model.nq > self.num_actions)
-        except Exception:
-            has_floating_base = False
-        if has_floating_base and (not initial_state or "qpos" not in initial_state):
-            dz = float(getattr(self, "spawn_root_z_offset", 0.0) or 0.0)
-            if dz > 0.0:
-                self.data.qpos[2] = float(self.data.qpos[2]) + dz
-        
-        # Forward kinematics (needed before computing any spawn adjustments).
-        mujoco.mj_forward(self.model, self.data)
+        return np.clip(action, -100.0, 100.0)
 
-        # Conservative anti-interpenetration lift:
-        # When we set joints to a different default pose than the XML's initial pose,
-        # the base z in the XML may no longer keep the feet above the ground (z=0),
-        # causing explosive contacts and NaNs in QACC very early.
-        #
-        # We estimate the lowest point of each *robot* geom (exclude world geoms) as:
-        #   geom_xpos.z - max(geom_size)
-        # and lift the floating base if any are below a small clearance.
-        if has_floating_base and pose_touched and (not initial_state or "qpos" not in initial_state):
-            try:
-                clearance = 0.01  # meters
-                geom_xpos = np.asarray(self.data.geom_xpos, dtype=np.float64)
-                geom_size = np.asarray(self.model.geom_size, dtype=np.float64)
-                geom_bodyid = np.asarray(self.model.geom_bodyid, dtype=np.int64)
-                geom_contype = np.asarray(self.model.geom_contype, dtype=np.int64)
-                geom_conaff = np.asarray(self.model.geom_conaffinity, dtype=np.int64)
+    # ------------------------------------------------------------------
+    # Control and physics
+    # ------------------------------------------------------------------
 
-                # Only consider *collidable* geoms attached to non-world bodies (robot bodies).
-                # This avoids over-lifting due to visual-only mesh geoms whose bounding sizes can be large.
-                robot_mask = (geom_bodyid > 0) & ((geom_contype != 0) | (geom_conaff != 0))
-                if np.any(robot_mask):
-                    sizes = geom_size[robot_mask]
-                    rad = np.max(sizes, axis=1)
-                    z_bottom_est = geom_xpos[robot_mask, 2] - rad
-                    min_z = float(np.min(z_bottom_est))
-                    if min_z < clearance:
-                        lift = float(clearance - min_z)
-                        self.data.qpos[2] = float(self.data.qpos[2]) + lift
-                        mujoco.mj_forward(self.model, self.data)
-            except Exception:
-                pass
-        
-        # Reset state
-        self.episode_length = 0
-        self.global_phase = 0.0
-        self._last_action = np.zeros(self.onnx_action_dim, dtype=np.float32)
-        
-        # Reset policy hidden state
-        self.policy.reset_hidden_state()
-        
-        # Reset observation builder
-        self.obs_builder.reset()
-        
-        return self.build_observation()
-    
-    def build_observation(self) -> np.ndarray:
-        """Build observation for policy.
-        
-        Override this in subclasses for task-specific observations.
-        
+    def step_control(self, action: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Apply action using explicit PD control.
+
+        Computes torques and writes them to ``data.ctrl``.
+
         Returns:
-            Observation array
+            Tuple of (torque, torque_util).
         """
-        return self.obs_builder.build(
-            joint_pos=self.joint_pos,  # ONNX order
-            joint_vel=self.joint_vel,  # ONNX order
-            base_quat=self.base_quat,
-            base_ang_vel=self.base_ang_vel,
-            base_lin_vel=self.base_lin_vel,
-            last_action=self._last_action,
-            velocity_command=self.velocity_command,
-            episode_length=self.episode_length,
-            step_dt=self.policy_dt,
+        current_action_scaled = action * self.action_scale
+        target_q = current_action_scaled + self.default_joint_pos
+        target_dq = np.zeros_like(current_action_scaled)
+
+        # Wheel joints use velocity control
+        target_q[self.is_wheel_mask] = 0.0
+        target_dq[self.is_wheel_mask] = current_action_scaled[self.is_wheel_mask]
+
+        # Read current joint state
+        if self.use_sensor_data:
+            current_q = self.data.sensordata[self.actuator_pos_sensor_indices]
+            current_dq = self.data.sensordata[self.actuator_vel_sensor_indices]
+        else:
+            current_q = self.data.qpos[-self.num_actions:]
+            current_dq = self.data.qvel[-self.num_actions:]
+
+        torque, torque_util = pd_control(
+            target_q, current_q, self.p_gains,
+            target_dq, current_dq, self.d_gains,
+            self.tau_limit,
         )
-    
-    def step(self, action: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
-        """Step simulation with policy action.
-        
-        If action is None, queries policy with current observation.
-        
-        Args:
-            action: Optional action to apply (if None, queries policy)
-            
-        Returns:
-            Tuple of (observation, info_dict)
-        """
-        # Get action from policy if not provided
-        if action is None:
-            obs = self.build_observation()
-            action = self.policy(obs)
 
-        action = np.array(action, dtype=np.float32).reshape(-1)
-        if action.shape[0] != self.onnx_action_dim:
-            raise RuntimeError(
-                f"[Sim2Sim] Policy action_dim mismatch: got {action.shape[0]} expected {self.onnx_action_dim}"
+        self.data.ctrl[:] = torque
+        return torque, torque_util
+
+    def step_physics(self) -> None:
+        """Step the MuJoCo physics simulation one timestep."""
+        mujoco.mj_step(self.model, self.data)
+
+    # ------------------------------------------------------------------
+    # State accessors
+    # ------------------------------------------------------------------
+
+    def get_base_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Get base position, orientation, linear velocity, and angular velocity."""
+        pos = self.data.qpos[:3].copy()
+        quat = self.data.qpos[3:7].copy()
+        lin_vel = self.data.qvel[:3].copy()
+        ang_vel = self.data.qvel[3:6].copy()
+        return pos, quat, lin_vel, ang_vel
+
+    @property
+    def current_time(self) -> float:
+        return self.data.time
+
+    # ------------------------------------------------------------------
+    # Hidden state management
+    # ------------------------------------------------------------------
+
+    def reset_hidden_states(self) -> None:
+        """Reset recurrent / transformer hidden states to zero."""
+        if self.hidden_state is not None:
+            self.hidden_state.fill(0)
+        if self.cell_state is not None:
+            self.cell_state.fill(0)
+        if self.is_transformer:
+            if self._tf_obs_buffer is not None:
+                self._tf_obs_buffer.fill(0)
+            if self._tf_valid_len is not None:
+                self._tf_valid_len.fill(0)
+
+
+class SimulatorWithRunLoop(BaseMujocoSimulator):
+    """Base simulator with a template run-loop.
+
+    Inner loop runs at **physics frequency** (``sim_dt``), with control
+    steps at decimated frequency — matching bfm_training behavior where
+    PD torques are recomputed every physics substep.
+
+    Subclasses override hook methods:
+    - ``get_command()`` — return velocity command
+    - ``on_physics_step()`` — per-physics-step logic
+    - ``on_control_step()`` — per-control-step logic with torque/torque_util
+    - ``render_frame()`` — customize frame rendering
+    - ``compute_results()`` — return final evaluation results
+    - ``cleanup_extras()`` — clean up task-specific resources
+    """
+
+    default_duration: float = 30.0
+    show_progress_bar: bool = False
+    cam_distance: float | None = None
+    window_title: str = "MuJoCo Simulation"
+
+    def __init__(self, onnx_path: str, mujoco_model_path: str):
+        super().__init__(onnx_path, mujoco_model_path)
+        self.renderer = None
+        self.cam = None
+        self._used_gui = False
+
+    def run(
+        self,
+        render: bool = False,
+        video_file: str = "",
+        headless: bool = True,
+        duration: float | None = None,
+        torque_data_dir: str = "",
+    ):
+        """Run the simulation.
+
+        Args:
+            render: Record video frames.
+            video_file: Output video file path.
+            headless: Run without display window.
+            duration: Simulation duration in seconds.
+            torque_data_dir: Directory to save torque data.
+
+        Returns:
+            Task-specific result from ``compute_results()``.
+        """
+        import cv2
+
+        duration = duration if duration is not None else self.default_duration
+        fps = 30.0
+        frames = []
+        command = None
+        command_step = 0
+        exteroception = None
+        torque_util = np.zeros(self.num_actions)
+        self._used_gui = not headless
+
+        if render or not headless:
+            self.renderer = mujoco.Renderer(self.model, height=480, width=640)
+            self.cam = mujoco.MjvCamera()
+            mujoco.mjv_defaultCamera(self.cam)
+            if self.cam_distance is not None:
+                self.cam.distance = self.cam_distance
+
+        try:
+            self.reset()
+            num_steps = int(duration / self.sim_dt)
+            step_iter = range(num_steps)
+
+            if self.show_progress_bar:
+                try:
+                    from tqdm import tqdm
+                    step_iter = tqdm(step_iter, desc="Simulating")
+                except ImportError:
+                    pass
+
+            print(f"[SimulatorWithRunLoop] Starting: {duration}s, {num_steps} physics steps")
+
+            for i in step_iter:
+                curr_time = i * self.sim_dt
+
+                self.on_physics_step(i, curr_time)
+
+                # Control step at decimated frequency
+                if i % self.decimation == 0:
+                    command = self.get_command(curr_time, command_step)
+                    command_step += 1
+
+                    obs, exteroception = self.build_observation(
+                        command=command, curr_time=curr_time,
+                    )
+                    new_action = self.step_inference(obs, exteroception)
+                    self.apply_action(new_action, i)
+
+                # Explicit PD every physics step (recomputes torque from held action)
+                torque, torque_util = self.step_control(self.action)
+                self.step_physics()
+
+                if i % self.decimation == 0:
+                    self.on_control_step(
+                        curr_time, command, command_step, torque, torque_util,
+                    )
+
+                # Render at video frame rate
+                if self.renderer is not None and self.cam is not None:
+                    render_interval = max(1, int(1.0 / (self.sim_dt * fps)))
+                    if i % render_interval == 0:
+                        frame = self.render_frame(
+                            command, command_step, torque_util, exteroception,
+                        )
+                        if render:
+                            frames.append(frame)
+                        if not headless:
+                            cv2.imshow(
+                                self.window_title,
+                                cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                            )
+                            if cv2.waitKey(1) & 0xFF == ord("q"):
+                                break
+
+            if video_file and frames:
+                self._save_video(video_file, frames, fps)
+
+            return self.compute_results(
+                torque_data_dir=torque_data_dir, headless=headless,
             )
 
-        # IsaacLab does NOT clip raw policy outputs to [-1, 1].
-        # The JointPositionAction term only applies a generous processed-action clip
-        # (e.g. [-100, 100]) after scale+offset, and the PhysX joint limits handle the rest.
-        # Clipping here would silently truncate large actions and destabilize the robot.
-
-        # Store action for observation (ONNX order)
-        self._last_action = action.copy()
-
-        # Reorder action to MuJoCo actuator order for control application
-        action_act = action[np.array(self.joint_mapping, dtype=np.int64)]
-        
-        # Convert action to target positions
-        target_q = self._action_to_target(action_act)
-        
-        # Step physics with decimation.
-        # Actuators are configured as position servos – set ctrl to target positions.
-        self.data.ctrl[:self.num_actions] = target_q
-        for _ in range(self.decimation):
-            mujoco.mj_step(self.model, self.data)
-
-        # CRITICAL: mj_step leaves velocity-dependent derived quantities
-        # (data.cvel, data.subtree_linvel, …) stale – they reflect the state
-        # BEFORE the last integration.  Calling mj_forward refreshes them so
-        # that base_ang_vel / base_lin_vel (which read from data.cvel) are
-        # consistent with the current qvel.  Without this, the angular-velocity
-        # observation lags by one physics step, feeding the policy stale data.
-        mujoco.mj_forward(self.model, self.data)
-
-        # Update state
-        self.episode_length += 1
-        self._update_phase()
-        
-        # Build observation
-        obs = self.build_observation()
-        
-        # Info
-        info = {
-            "base_pos": self.base_pos.copy(),
-            "base_quat": self.base_quat.copy(),
-            "base_lin_vel": self.base_lin_vel.copy(),
-            "joint_pos": self.joint_pos.copy(),  # ONNX order
-        }
-        
-        return obs, info
-    
-    def _action_to_target(self, action: np.ndarray) -> np.ndarray:
-        """Convert policy action to target joint positions.
-        
-        Implements IsaacLab/MJLab JointPositionAction semantics:
-          processed_action = raw_action * scale + offset
-
-        Notes:
-        - In IsaacLab when `use_default_offset=True`, offset == default_joint_pos.
-        - Our ONNX metadata exports BOTH `default_joint_pos` and `action_offset`, and they can be identical.
-          Therefore, we must NOT add both (would double the default pose and destabilize standing).
-        
-        Args:
-            action: Raw policy output
-            
-        Returns:
-            Target joint positions
-        """
-        base = self.action_offset if bool(getattr(self, "_action_offset_provided", False)) else self.default_joint_pos
-        return base + np.asarray(action, dtype=np.float32) * self.action_scale
-    
-    def _compute_control(self, target_q: np.ndarray) -> np.ndarray:
-        """Compute PD control torques.
-        
-        Args:
-            target_q: Target joint positions
-            
-        Returns:
-            Control torques
-        """
-        return pd_control(
-            target_q=target_q,
-            current_q=self.joint_pos_actuator,
-            current_dq=self.joint_vel_actuator,
-            kp=self.kp,
-            kd=self.kd,
-            tau_limits=self.tau_limits,
-        )
-    
-    def _update_phase(self) -> None:
-        """Update gait phase."""
-        gait_period = 0.8  # Default, can be overridden
-        delta_phase = self.policy_dt / gait_period
-        self.global_phase = (self.global_phase + delta_phase) % 1.0
-    
-    def set_velocity_command(self, vx: float, vy: float, wz: float) -> None:
-        """Set velocity command for locomotion.
-        
-        Args:
-            vx: Forward velocity (m/s)
-            vy: Lateral velocity (m/s)
-            wz: Yaw rate (rad/s)
-        """
-        self.velocity_command = np.array([vx, vy, wz])
-    
-    def run_episode(
-        self,
-        max_steps: int = 1000,
-        render: bool = False,
-        velocity_command: tuple[float, float, float] | None = None,
-    ) -> dict:
-        """Run a complete episode.
-        
-        Args:
-            max_steps: Maximum number of policy steps
-            render: Whether to render (opens viewer)
-            velocity_command: Optional (vx, vy, wz) command
-            
-        Returns:
-            Episode statistics
-        """
-        self.reset()
-        
-        if velocity_command:
-            self.set_velocity_command(*velocity_command)
-        
-        if render:
-            viewer = mujoco.viewer.launch_passive(self.model, self.data)
-        else:
-            viewer = None
-        
-        episode_data = {
-            "base_pos": [],
-            "base_quat": [],
-            "base_lin_vel": [],
-            "joint_pos": [],
-            "actions": [],
-        }
-        
-        import time as _time
-
-        try:
-            for step in range(max_steps):
-                t0 = _time.monotonic()
-                obs, info = self.step()
-                
-                # Store data
-                episode_data["base_pos"].append(info["base_pos"])
-                episode_data["base_quat"].append(info["base_quat"])
-                episode_data["base_lin_vel"].append(info["base_lin_vel"])
-                episode_data["joint_pos"].append(info["joint_pos"])
-                episode_data["actions"].append(self._last_action.copy())
-                
-                # Check termination
-                if self._check_termination():
-                    break
-                
-                # Render with real-time pacing
-                if viewer is not None:
-                    viewer.sync()
-                    remaining = self.policy_dt - (_time.monotonic() - t0)
-                    if remaining > 0:
-                        _time.sleep(remaining)
         finally:
-            if viewer is not None:
-                viewer.close()
-        
-        # Convert to arrays
-        for key in episode_data:
-            episode_data[key] = np.array(episode_data[key])
-        
-        # Compute statistics
-        stats = {
-            "num_steps": len(episode_data["base_pos"]),
-            "survived": not self._check_termination(),
-            "distance_traveled": np.linalg.norm(
-                episode_data["base_pos"][-1, :2] - episode_data["base_pos"][0, :2]
-            ) if len(episode_data["base_pos"]) > 1 else 0,
-            "mean_velocity": np.mean(np.linalg.norm(episode_data["base_lin_vel"][:, :2], axis=1))
-            if len(episode_data["base_lin_vel"]) > 0 else 0,
-        }
-        
-        return {"data": episode_data, "stats": stats}
+            self._cleanup()
 
-    def run_episodes_continuous(
+    # ------------------------------------------------------------------
+    # Hook methods
+    # ------------------------------------------------------------------
+
+    def get_command(self, curr_time: float, command_step: int) -> np.ndarray | None:
+        """Return command for current timestep."""
+        return None
+
+    def on_physics_step(self, step_i: int, curr_time: float) -> None:
+        """Called every physics step."""
+
+    def on_control_step(
         self,
-        num_episodes: int = 10,
-        max_steps_per_episode: int = 1000,
-        velocity_command: tuple[float, float, float] | None = None,
-        render: bool = True,
-    ) -> list[dict]:
-        """Run multiple episodes in a single viewer session (continuous playback).
-
-        This is intended for visualization: the MuJoCo viewer window stays open
-        while episodes reset internally upon termination or reaching max steps.
-        """
-        if not render:
-            # If not rendering, just fall back to standard per-episode execution.
-            return [
-                self.run_episode(
-                    max_steps=max_steps_per_episode,
-                    render=False,
-                    velocity_command=velocity_command,
-                )
-                for _ in range(num_episodes)
-            ]
-
-        import time as _time
-
-        viewer = mujoco.viewer.launch_passive(self.model, self.data)
-        results: list[dict] = []
-        try:
-            for _ep in range(num_episodes):
-                self.reset()
-                if velocity_command:
-                    self.set_velocity_command(*velocity_command)
-
-                episode_data = {
-                    "base_pos": [],
-                    "base_quat": [],
-                    "base_lin_vel": [],
-                    "joint_pos": [],
-                    "actions": [],
-                }
-
-                for _step in range(max_steps_per_episode):
-                    t0 = _time.monotonic()
-                    _obs, info = self.step()
-
-                    episode_data["base_pos"].append(info["base_pos"])
-                    episode_data["base_quat"].append(info["base_quat"])
-                    episode_data["base_lin_vel"].append(info["base_lin_vel"])
-                    episode_data["joint_pos"].append(info["joint_pos"])
-                    episode_data["actions"].append(self._last_action.copy())
-
-                    viewer.sync()
-
-                    if self._check_termination():
-                        break
-
-                    remaining = self.policy_dt - (_time.monotonic() - t0)
-                    if remaining > 0:
-                        _time.sleep(remaining)
-
-                for key in episode_data:
-                    episode_data[key] = np.array(episode_data[key])
-
-                stats = {
-                    "num_steps": len(episode_data["base_pos"]),
-                    "survived": not self._check_termination(),
-                    "distance_traveled": np.linalg.norm(
-                        episode_data["base_pos"][-1, :2] - episode_data["base_pos"][0, :2]
-                    )
-                    if len(episode_data["base_pos"]) > 1
-                    else 0,
-                    "mean_velocity": np.mean(
-                        np.linalg.norm(episode_data["base_lin_vel"][:, :2], axis=1)
-                    )
-                    if len(episode_data["base_lin_vel"]) > 0
-                    else 0,
-                }
-                results.append({"data": episode_data, "stats": stats})
-        finally:
-            viewer.close()
-
-        return results
-
-    def run_forever_until_closed(
-        self,
-        max_steps_per_episode: int = 1000,
-        velocity_command: tuple[float, float, float] | None = None,
+        curr_time: float,
+        command: np.ndarray | None,
+        command_step: int,
+        torque: np.ndarray,
+        torque_util: np.ndarray,
     ) -> None:
-        """Continuously run episodes in a single MuJoCo viewer until the user closes it.
+        """Called every control step."""
 
-        - Opens one viewer window
-        - Runs policy steps and syncs the viewer every step
-        - When termination happens or max steps reached, resets and continues
-        - Exits cleanly when the viewer window is closed by the user
-        - Real-time pacing keeps the viewer at the correct policy frequency
-        """
-        import time as _time
+    def apply_action(self, new_action: np.ndarray, step_i: int) -> None:
+        """Apply action (with optional delay). Override for scheduling."""
+        self.action = new_action
 
-        viewer = mujoco.viewer.launch_passive(self.model, self.data)
+    def render_frame(
+        self,
+        command: np.ndarray | None,
+        command_step: int,
+        torque_util: np.ndarray,
+        exteroception: np.ndarray | None,
+    ) -> np.ndarray:
+        """Render a single frame. Override for visualization overlays."""
+        self.cam.lookat[:] = self.data.qpos[:3]
+        self.renderer.update_scene(self.data, self.cam)
+        rgb_arr = self.renderer.render()
+
         try:
-            while viewer.is_running():
-                self.reset()
-                if velocity_command:
-                    self.set_velocity_command(*velocity_command)
+            from scipy.spatial.transform import Rotation as R
 
-                for _step in range(max_steps_per_episode):
-                    if not viewer.is_running():
-                        return
+            _, quat, lin_vel, _ = self.get_base_state()
+            r = R.from_quat([quat[1], quat[2], quat[3], quat[0]])
+            base_lin_vel = r.inv().apply(lin_vel)
 
-                    t0 = _time.monotonic()
-                    self.step()
-                    viewer.sync()
+            from ..visualization import create_combined_visualization
 
-                    if self._check_termination():
-                        break
+            return create_combined_visualization(
+                sim_frame=rgb_arr,
+                torque_util=torque_util,
+                num_actions=self.num_actions,
+                base_lin_vel=base_lin_vel,
+                exteroception=None,
+                exteroception_type=None,
+                robot_z=self.data.qpos[2],
+                sim_time=self.data.time,
+                command=command,
+                command_idx=command_step,
+            )
+        except ImportError:
+            return rgb_arr
 
-                    remaining = self.policy_dt - (_time.monotonic() - t0)
-                    if remaining > 0:
-                        _time.sleep(remaining)
-        finally:
-            viewer.close()
-    
-    def _check_termination(self) -> bool:
-        """Check if episode should terminate.
-        
-        Override in subclasses for task-specific termination.
-        
-        Returns:
-            True if episode should end
-        """
-        # Default: check for bad orientation
-        quat = self.base_quat
-        # Compute up vector in world frame
-        R = self._quat_to_rotation_matrix(quat)
-        up_world = R @ np.array([0, 0, 1])
-        
-        # Check angle from vertical
-        cos_angle = up_world[2]
-        if cos_angle < 0.5:  # > ~60 degrees tilt
-            return True
-        
-        # Check height
-        if self.base_pos[2] < 0.1:
-            return True
-        
-        return False
-    
+    def compute_results(self, torque_data_dir: str = "", headless: bool = True):
+        """Compute and return final evaluation results."""
+        return None
+
+    def cleanup_extras(self) -> None:
+        """Clean up task-specific resources."""
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def _quat_to_rotation_matrix(quat: np.ndarray) -> np.ndarray:
-        """Convert quaternion [w,x,y,z] to rotation matrix."""
-        w, x, y, z = quat
-        return np.array([
-            [1 - 2*y*y - 2*z*z, 2*x*y - 2*w*z, 2*x*z + 2*w*y],
-            [2*x*y + 2*w*z, 1 - 2*x*x - 2*z*z, 2*y*z - 2*w*x],
-            [2*x*z - 2*w*y, 2*y*z + 2*w*x, 1 - 2*x*x - 2*y*y],
-        ])
+    def _save_video(video_file: str, frames: list[np.ndarray], fps: float) -> None:
+        if not frames:
+            return
+        try:
+            import mediapy as media
+            media.write_video(video_file, frames, fps=fps)
+            print(f"[SimulatorWithRunLoop] Video saved: {video_file}")
+            return
+        except ImportError:
+            pass
+        import cv2
+        h, w = frames[0].shape[:2]
+        try:
+            import subprocess
+            proc = subprocess.Popen(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "rawvideo", "-pix_fmt", "rgb24",
+                    "-s", f"{w}x{h}", "-r", str(int(fps)),
+                    "-i", "pipe:0",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart", "-preset", "veryfast", "-crf", "23",
+                    video_file,
+                ],
+                stdin=subprocess.PIPE,
+            )
+            for frame in frames:
+                proc.stdin.write(frame.tobytes())
+            proc.stdin.close()
+            proc.wait()
+            if proc.returncode == 0:
+                print(f"[SimulatorWithRunLoop] Video saved: {video_file}")
+                return
+        except FileNotFoundError:
+            pass
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(video_file, fourcc, int(fps), (w, h))
+        for frame in frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        writer.release()
+        print(f"[SimulatorWithRunLoop] Video saved: {video_file}")
+
+    def _cleanup(self) -> None:
+        if self.renderer is not None:
+            del self.renderer
+            self.renderer = None
+        if getattr(self, "_used_gui", False):
+            import cv2
+            with contextlib.suppress(Exception):
+                cv2.destroyAllWindows()
+        self.cleanup_extras()

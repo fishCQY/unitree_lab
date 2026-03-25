@@ -24,21 +24,21 @@ try:
 except ImportError:
     mujoco = None
 
-from ..core.onnx_utils import OnnxConfig
 from ..core.physics import compute_projected_gravity, compute_base_ang_vel_body
 
 
 class ObservationBuilder:
     """Builder for observations matching IsaacLab semantics.
-    
+
     Constructs observations by:
     1. Computing each term from state
     2. Applying per-term scale
     3. Applying per-term clip
     4. Concatenating in correct order
+
+    Accepts ``onnx_config`` as a **dict** (aligned with bfm_training).
     """
-    
-    # Standard observation term names
+
     SUPPORTED_TERMS = [
         "base_ang_vel",
         "projected_gravity",
@@ -48,29 +48,27 @@ class ObservationBuilder:
         "joint_vel",
         "joint_vel_rel",
         "last_action",
-        # IsaacLab policy obs group commonly names this term "actions"
-        # (even though the underlying function is last_action).
         "actions",
         "gait_phase",
         "height_scan",
         "height_scan_safe",
         "base_lin_vel",
     ]
-    
+
     def __init__(
         self,
         model: "mujoco.MjModel",
         data: "mujoco.MjData",
-        onnx_config: OnnxConfig,
+        onnx_config: dict,
         joint_mapping: list[int],
         height_scanner: Any | None = None,
     ):
         """Initialize observation builder.
-        
+
         Args:
             model: MuJoCo model
             data: MuJoCo data
-            onnx_config: ONNX configuration with obs structure
+            onnx_config: ONNX configuration **dict** with obs structure
             joint_mapping: Mapping from XML actuator to ONNX joint order
             height_scanner: Optional height scanner for exteroception
         """
@@ -80,31 +78,26 @@ class ObservationBuilder:
         self.joint_mapping = joint_mapping
         self.height_scanner = height_scanner
 
-        # Canonical ordering for sim2sim:
-        # - All observations passed to the ONNX policy must be in ONNX joint order (metadata joint_names order).
-        # - The MuJoCo actuator order may differ; mapping is handled by BaseMujocoSimulator at control-application time.
-        # Therefore, ObservationBuilder assumes `joint_pos/joint_vel/last_action/default_joint_pos` are already in ONNX order.
-        self.num_actions = int(onnx_config.output_dim) if int(onnx_config.output_dim or 0) > 0 else 0
-        if self.num_actions <= 0:
-            self.num_actions = len(onnx_config.joint_names) if onnx_config.joint_names else len(joint_mapping)
-        
-        # Parse observation structure (from ONNX metadata if available)
-        self.obs_names = onnx_config.observation_names or []
-        self.obs_dims = onnx_config.observation_dims or []
-        self.obs_scales = onnx_config.observation_scales or {}
+        num_actions_raw = onnx_config.get("num_actions", 0) or onnx_config.get("output_dim", 0) or 0
+        self.num_actions = int(num_actions_raw) if int(num_actions_raw) > 0 else len(
+            onnx_config.get("joint_names", []) or joint_mapping
+        )
 
-        # History stacking configuration
-        self.history_length = onnx_config.history_length or 1
-        self.single_frame_dims = onnx_config.single_frame_dims or {}
-        # IsaacLab uses oldest-first stacking by default, so default to False here.
-        self.history_newest_first = bool(getattr(onnx_config, "history_newest_first", False))
+        self.obs_names = onnx_config.get("observation_names", []) or []
+        self.obs_dims = onnx_config.get("observation_dims", []) or []
+        self.obs_scales = onnx_config.get("observation_scales", {}) or {}
+
+        self.history_length = onnx_config.get("history_length", 1) or 1
+        self.single_frame_dims = onnx_config.get("single_frame_dims", {}) or {}
+        self.history_newest_first = bool(onnx_config.get("history_newest_first", False))
 
         # If metadata is missing, try best-effort inference from model IO dims.
-        # This avoids hard-crashes like: Got 96 Expected 490.
-        if not self.obs_names and onnx_config.input_dim and onnx_config.output_dim:
+        input_dim_raw = onnx_config.get("input_dim") or onnx_config.get("total_obs_dim") or 0
+        output_dim_raw = onnx_config.get("output_dim") or onnx_config.get("num_actions") or 0
+        if not self.obs_names and input_dim_raw and output_dim_raw:
             inferred = self._infer_obs_structure_from_io(
-                input_dim=int(onnx_config.input_dim),
-                num_actions=int(onnx_config.output_dim),
+                input_dim=int(input_dim_raw),
+                num_actions=int(output_dim_raw),
             )
             if inferred is not None:
                 self.obs_names = inferred["observation_names"]
@@ -116,13 +109,14 @@ class ObservationBuilder:
                     self.obs_scales = inferred.get("observation_scales", {})
                 print(
                     "[ObservationBuilder] Inferred observation structure from ONNX IO dims: "
-                    f"input_dim={onnx_config.input_dim}, num_actions={onnx_config.output_dim}, "
+                    f"input_dim={input_dim_raw}, num_actions={output_dim_raw}, "
                     f"history_length={self.history_length}, terms={self.obs_names}"
                 )
         
         # Default joint positions for relative observations (ONNX order)
-        if onnx_config.default_joint_pos:
-            default = np.array(onnx_config.default_joint_pos, dtype=np.float32).reshape(-1)
+        default_jp = onnx_config.get("default_joint_pos", [])
+        if default_jp:
+            default = np.array(default_jp, dtype=np.float32).reshape(-1)
             if default.shape[0] != self.num_actions:
                 # Best-effort: pad/truncate to match action dimension
                 if default.shape[0] < self.num_actions:
@@ -489,10 +483,9 @@ class ObservationBuilder:
                 obs = self.height_scanner.scan()
             else:
                 # Return zeros if no height scanner
-                expected_size = self.config.height_scan_size
+                expected_size = self.config.get("height_scan_size")
                 if expected_size:
-                    # Compute expected number of points
-                    resolution = self.config.height_scan_resolution
+                    resolution = self.config.get("height_scan_resolution", 0.1)
                     nx = int(expected_size[0] / resolution) + 1
                     ny = int(expected_size[1] / resolution) + 1
                     obs = np.zeros(nx * ny)

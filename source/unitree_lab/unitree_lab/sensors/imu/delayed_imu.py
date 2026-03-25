@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2025, Light Robotics.
+# Copyright (c) 2024-2025, unitree_lab contributors.
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause

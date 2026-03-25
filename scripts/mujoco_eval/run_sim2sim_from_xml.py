@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -43,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--deploy-yaml", type=str, default=None)
     p.add_argument("--config-override", type=str, default=None, help="JSON string override")
 
-    p.add_argument("--task", type=str, default="rough_forward", help="Only used for velocity profile defaults")
+    p.add_argument("--task", type=str, default="flat_stand", help="Only used for velocity profile defaults")
     p.add_argument("--render", action="store_true")
     p.add_argument("--follow", action="store_true")
     p.add_argument("--teleop", type=str, default="keyboard", choices=["keyboard", "off"])
@@ -63,7 +64,7 @@ def main() -> None:
     if not xml.exists():
         raise FileNotFoundError(f"XML not found: {xml}")
 
-    from unitree_lab.mujoco_utils.evaluation.eval_task import get_eval_task
+    from unitree_lab.mujoco_utils.evaluation.eval_task import TERRAIN_FLAT, get_eval_task
     from run_sim2sim_locomotion import (
         _deploy_yaml_to_config_override,
         _load_deploy_yaml,
@@ -71,9 +72,8 @@ def main() -> None:
         run_headless,
     )
 
-    task = get_eval_task(args.task)
-    # Do not inject terrain; use XML terrain as-is.
-    task.terrain_type = "flat"
+    # Do not inject terrain; use XML terrain as-is (copy so we never mutate registry tasks).
+    task = replace(get_eval_task(args.task), terrain=TERRAIN_FLAT)
 
     override = {}
     if args.deploy_yaml:
@@ -81,12 +81,11 @@ def main() -> None:
     if args.config_override:
         override.update(json.loads(args.config_override))
 
-    from unitree_lab.mujoco_utils.simulation.base_simulator import BaseMujocoSimulator
+    from unitree_lab.mujoco_utils.simulation.locomotion_simulator import LocomotionMujocoSimulator
 
-    simulator = BaseMujocoSimulator(
-        xml_path=str(xml),
+    simulator = LocomotionMujocoSimulator(
         onnx_path=str(onnx),
-        config_override=override if override else None,
+        mujoco_model_path=str(xml),
     )
 
     velocity = tuple(args.velocity) if args.velocity else None
@@ -109,6 +108,7 @@ def main() -> None:
             output_dir="eval_results",
             video_steps=args.max_steps,
             velocity=velocity,
+            max_steps=args.max_steps,
         )
 
 

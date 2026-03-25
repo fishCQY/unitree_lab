@@ -6,6 +6,8 @@
 """Definitions for neural-network components for RL-agents."""
 
 from .actor_critic import ActorCritic
+from .actor_critic_transformer import ActorCriticTransformer
+from .actor_critic_transformer_base import ActorCriticTransformerBase
 from .actor_critic_cnn import ActorCriticCNN
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .actor_critic_command_codec import (
@@ -22,6 +24,8 @@ from .amp import AMPDiscriminator, resolve_amp_config
 
 __all__ = [
     "ActorCritic",
+    "ActorCriticTransformer",
+    "ActorCriticTransformerBase",
     "ActorCriticCNN",
     "ActorCriticRecurrent",
     "ActorCriticCommandCodec",
